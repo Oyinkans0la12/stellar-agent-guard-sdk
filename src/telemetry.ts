@@ -31,8 +31,8 @@
  * content. The format and the collision notes are documented in
  * `docs/event-schema.md` and implemented by `guardEventId` below.
  */
-import { createHash } from "node:crypto";
 import { rpc, scValToNative, StrKey, xdr } from "@stellar/stellar-sdk";
+import { bytesToHex, sha256Hex, utf8Length } from "./hash.ts";
 import { GUARD_AUTH_RESULTS, GUARD_EVENT_TOPICS, decodeAuthDecision, normalizeEventData, type GuardAuthDecision } from "./events.ts";
 import { topicSymbols } from "./invoke.ts";
 import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
@@ -215,7 +215,7 @@ export function guardEventId(event: GuardEventIdentityInput): string {
       event.transactionHash ?? (event.ledger !== null ? String(event.ledger) : "unknown");
     return `ledger:${anchor}:${event.topics[0] ?? ""}`;
   }
-  return `diag:${createHash("sha256").update(diagnosticIdMaterial(event)).digest("hex")}`;
+  return `diag:${sha256Hex(diagnosticIdMaterial(event))}`;
 }
 
 /**
@@ -236,7 +236,7 @@ function diagnosticIdMaterial(event: GuardEventIdentityInput): string {
     stableStringify(event.data),
   ];
   return parts
-    .map((part) => `${Buffer.byteLength(part, "utf8")}:${part}`)
+    .map((part) => `${utf8Length(part)}:${part}`)
     .join("");
 }
 
@@ -253,7 +253,7 @@ function stableStringify(value: unknown, depth = 0): string {
   if (typeof value === "boolean" || typeof value === "number" || typeof value === "string") {
     return JSON.stringify(value);
   }
-  if (value instanceof Uint8Array) return `bytes:${Buffer.from(value).toString("hex")}`;
+  if (value instanceof Uint8Array) return `bytes:${bytesToHex(value)}`;
   if (depth >= 8) return "depth";
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item, depth + 1)).join(",")}]`;
@@ -1707,7 +1707,7 @@ function toJsonSafe(value: unknown): unknown {
   ) {
     return value;
   }
-  if (value instanceof Uint8Array) return `bytes:${Buffer.from(value).toString("hex")}`;
+  if (value instanceof Uint8Array) return `bytes:${bytesToHex(value)}`;
   if (Array.isArray(value)) {
     return value.map((item) => {
       const normalized = toJsonSafe(item);

@@ -77,6 +77,8 @@
     "test:coverage": "node --import tsx scripts/run-tests.ts all --coverage",
     "test:coverage:floor": "c8 --check-coverage --include=src/preflight.ts --include=src/policy.ts --include=src/invoke.ts node --import tsx scripts/run-tests.ts unit",
     "test:exports": "node --import tsx scripts/check-export-map.ts",
+    "test:types:packed": "node --import tsx scripts/check-packed-types.ts",
+    "test:browser": "node scripts/check-browser-entry.mjs",
     "check:bundle-size": "node scripts/check-bundle-size.mjs",
     "test:smoke": "node --input-type=module -e \"import('./dist/index.js').then(m => { if (!m.PreFlightInterceptor) throw new Error('Missing PreFlightInterceptor'); console.log('ESM export-map resolution smoke test passed: ' + Object.keys(m).length + ' exports found'); })\"",
     "bench": "node --import tsx benches/check-decode.bench.ts",

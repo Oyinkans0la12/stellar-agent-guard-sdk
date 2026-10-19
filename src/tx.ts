@@ -41,7 +41,6 @@
  * interface when the contracts decision does. Research, options and the revisit
  * trigger: `docs/concepts/multi-key-agent-signing.md`.
  */
-import { createHash } from "node:crypto";
 import {
   Account,
   Address,
@@ -62,6 +61,7 @@ import {
   SimulationError,
 } from "./errors.ts";
 import { systemClock, type Clock } from "./clock.ts";
+import { bytesToHex, sha256 } from "./hash.ts";
 import type { ContractAddress } from "./policy.ts";
 
 /** Extra ledger validity granted to a guard auth entry when it is signed. */
@@ -121,7 +121,7 @@ export const GUARD_STORAGE_KEYS = [
 
 /** Stable identity for a ledger key, for de-duplicating footprint entries. */
 function ledgerKeyId(key: xdr.LedgerKey): string {
-  return Buffer.from(key.toXDR()).toString("base64");
+  return bytesToHex(key.toXDR());
 }
 
 export function addressToScVal(strkey: string): xdr.ScVal {
@@ -240,7 +240,7 @@ export interface AgentSigner {
 export function keypairAgentSigner(agent: Keypair): AgentSigner {
   return {
     publicKey: agent.publicKey(),
-    signDigest: (digest) => agent.sign(Buffer.from(digest)),
+    signDigest: (digest) => agent.sign(digest),
   };
 }
 
@@ -317,7 +317,7 @@ export async function buildGuardAuthEntry(params: {
     ),
     subInvocations: [],
   });
-  const networkId = createHash("sha256").update(networkPassphrase).digest();
+  const networkId = sha256(networkPassphrase);
   const guardAddress = new Address(guard).toScAddress();
 
   const preimage =
@@ -340,7 +340,7 @@ export async function buildGuardAuthEntry(params: {
           }),
         );
 
-  const digest = createHash("sha256").update(preimage.toXDR()).digest();
+  const digest = sha256(preimage.toXDR());
   let signature: Uint8Array;
   try {
     signature = await signer.signDigest(digest);
@@ -615,7 +615,7 @@ export interface SubmissionResult {
 function toPlain(value: unknown, depth = 0): unknown {
   if (value === null || value === undefined || depth > 8) return value ?? null;
   if (typeof value === "bigint") return value.toString();
-  if (value instanceof Uint8Array) return `0x${Buffer.from(value).toString("hex")}`;
+  if (value instanceof Uint8Array) return `0x${bytesToHex(value)}`;
   if (typeof value !== "object") return value;
   const withXdr = value as { toXdrObject?: () => unknown };
   if (typeof withXdr.toXdrObject === "function") {

@@ -30,12 +30,20 @@ import type { PreFlightDecision, PreFlightInterceptor } from "../preflight.ts";
 import type { ContractCall } from "../tx.ts";
 import {
   throwAdapterConfigError,
+  validateBatchInterceptor,
+  validateBlockedHookLogger,
+  validateContractMapping,
   validateInterceptor,
   validateOptionalFunction,
-  validateRequiredFunction,
   type AdapterConfigIssue,
 } from "./validate.ts";
-import { blockedInfoFor, runBlockedHook, type GuardBlockedHook } from "./shared.ts";
+import {
+  blockedInfoFor,
+  blockedInfoForBatch,
+  runBlockedHook,
+  type BlockedHookLogger,
+  type GuardBlockedHook,
+} from "./shared.ts";
 
 /** The subset of ElizaOS's `Validator` signature this adapter implements. */
 export type ElizaValidator = (
@@ -57,7 +65,14 @@ export interface ElizaGuardOptions {
    * Turn the action's intent into the guarded contract call it would make, or
    * `null` when this action moves no funds.
    */
-  toContractCall: (message: unknown, state: unknown) => ContractCall | null;
+  toContractCall?: (message: unknown, state: unknown) => ContractCall | null;
+  /**
+   * Additive batch mapping (issue #318): the ordered calls this action performs.
+   * Takes precedence over `toContractCall`; every call is checked before the
+   * action is admitted (all-or-nothing). `null` or an empty array means the
+   * action moves no funds.
+   */
+  toContractCalls?: (message: unknown, state: unknown) => readonly ContractCall[] | null;
   /** The action's own validation, composed in front of the guard's. */
   baseValidate?: ElizaValidator;
   /** Observe every decision — the place to wire telemetry. */
@@ -72,6 +87,11 @@ export interface ElizaGuardOptions {
    * `src/adapters/shared.ts`.
    */
   onBlocked?: GuardBlockedHook;
+  /**
+   * Explicit sink for a swallowed `onBlocked` failure. Omitted (the default),
+   * a throwing hook is silent (issue #314).
+   */
+  blockedHookLogger?: BlockedHookLogger;
 }
 
 /**
@@ -85,8 +105,13 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
   const issues: AdapterConfigIssue[] = [];
   const interceptorIssue = validateInterceptor(options.interceptor);
   if (interceptorIssue) issues.push(interceptorIssue);
-  const toCallIssue = validateRequiredFunction("toContractCall", options.toContractCall);
-  if (toCallIssue) issues.push(toCallIssue);
+  issues.push(...validateContractMapping(options));
+  if (options.toContractCalls) {
+    const batchIssue = validateBatchInterceptor(options.interceptor);
+    if (batchIssue) issues.push(batchIssue);
+  }
+  const blockedLoggerIssue = validateBlockedHookLogger(options.blockedHookLogger);
+  if (blockedLoggerIssue) issues.push(blockedLoggerIssue);
   const baseValidateIssue = validateOptionalFunction("baseValidate", options.baseValidate);
   if (baseValidateIssue) issues.push(baseValidateIssue);
   const onDecisionIssue = validateOptionalFunction("onDecision", options.onDecision);
@@ -101,14 +126,38 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
       if (!baseOk) return false; // the action was not applicable in the first place
     }
 
-    const call = options.toContractCall(message, state);
-    if (!call) return true; // not a fund-moving action; nothing for the guard to say
+    const calls = options.toContractCalls
+      ? [...(options.toContractCalls(message, state) ?? [])]
+      : (() => {
+          const call = options.toContractCall?.(message, state) ?? null;
+          return call ? [call] : [];
+        })();
+    if (calls.length === 0) return true; // not fund-moving; nothing for the guard to say
 
-    const decision = await options.interceptor.check(call);
-    options.onDecision?.(decision);
-    if (decision.allowed) return true;
+    if (calls.length === 1) {
+      const decision = await options.interceptor.check(calls[0]!);
+      options.onDecision?.(decision);
+      if (decision.allowed) return true;
 
-    runBlockedHook(options.onBlocked, blockedInfoFor("elizaos", call, decision));
+      runBlockedHook(
+        options.onBlocked,
+        blockedInfoFor("elizaos", calls[0]!, decision),
+        options.blockedHookLogger,
+      );
+      return false;
+    }
+
+    // Batch mapping: a single refusal drops the whole action before its handler
+    // runs; every per-call verdict is reported through `onDecision`.
+    const batch = await options.interceptor.checkBatch(calls);
+    for (const verdict of batch.verdicts) options.onDecision?.(verdict);
+    if (batch.admissible) return true;
+
+    runBlockedHook(
+      options.onBlocked,
+      blockedInfoForBatch("elizaos", calls, batch.verdicts),
+      options.blockedHookLogger,
+    );
     return false;
   };
 }

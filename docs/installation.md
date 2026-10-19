@@ -2,7 +2,9 @@
 
 ## Requirements
 
-- `Node.js`: `v24.0.0` or higher
+- `Node.js`: `v24.0.0` or higher for building/tests. The published ESM root entry is
+  browser-safe: it reaches no `node:*` built-ins, verified in CI by
+  `npm run test:browser`.
 - `@stellar/stellar-sdk`: `^17.0.1` (runtime dependency)
 
 ## Installing from NPM

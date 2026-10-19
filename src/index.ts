@@ -341,6 +341,9 @@ export type {
 
 export {
   throwAdapterConfigError,
+  validateBatchInterceptor,
+  validateBlockedHookLogger,
+  validateContractMapping,
   validateInterceptor,
   validateOptionalFunction,
   validateRequiredFunction,
@@ -372,6 +375,8 @@ export type {
 // Exported so a consumer can type its sink and build the payload itself.
 export {
   blockedInfoFor,
+  blockedInfoForBatch,
+  mapContractCalls,
   runBlockedHook,
 } from "./adapters/shared.ts";
 
@@ -380,6 +385,7 @@ export type {
   GuardAdapterName,
   GuardBlockedHook,
   GuardBlockedInfo,
+  GuardCallMapper,
 } from "./adapters/shared.ts";
 
 // Optional logging. `SILENT_LOGGER` is the default every config resolves to

@@ -220,3 +220,61 @@ describe("wrapToolWithGuard", () => {
     );
   });
 });
+
+describe("Vercel AI SDK ordered call batch (issue #318)", () => {
+  const BLOCKED: PreFlightDecision = {
+    allowed: false,
+    kind: "blocked",
+    reason: "per_tx_cap_exceeded",
+    explanation: "per-transaction cap exceeded",
+    detail: "stub",
+    diagnosticEvents: [],
+  };
+  const ADMISSIBLE: PreFlightDecision = {
+    allowed: true,
+    kind: "admissible",
+    estimatedResourceFee: 1n,
+    footprintKeys: 1,
+  };
+
+  function batchInterceptor(verdicts: PreFlightDecision[]): PreFlightInterceptor {
+    return {
+      check: async () => {
+        throw new Error("single-call check must not run for a batch mapping");
+      },
+      checkBatch: async () => ({
+        admissible: verdicts.every((verdict) => verdict.allowed),
+        overallAdmissible: verdicts.every((verdict) => verdict.allowed),
+        verdicts,
+        calls: verdicts,
+        totalEstimatedResourceFee: 0n,
+      }),
+    } as unknown as PreFlightInterceptor;
+  }
+
+  it("checks the whole batch first and does not execute when a later call is blocked", async () => {
+    const seen: PreFlightDecision[] = [];
+    let entered = 0;
+    const guard = createVercelAIGuard({
+      interceptor: batchInterceptor([ADMISSIBLE, BLOCKED]),
+      toContractCalls: () => [CALL, { ...CALL, fn: "transfer_from" }],
+      onDecision: (_call, decision) => seen.push(decision),
+    });
+    const tool = guard("batch_transfer", {
+      execute: async () => {
+        entered += 1;
+        return "ran";
+      },
+    });
+
+    await assert.rejects(
+      () => (tool.execute as (input: never) => Promise<unknown>)(null as never),
+      GuardBlockedError,
+    );
+    assert.equal(entered, 0);
+    assert.deepEqual(
+      seen.map((decision) => decision.kind),
+      ["admissible", "blocked"],
+    );
+  });
+});

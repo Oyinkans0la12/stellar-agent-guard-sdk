@@ -4,10 +4,10 @@
  * (issue #145).
  *
  * What it does: bundles `scripts/bundle-size-entry.ts` — the stable,
- * dashboard-shaped import — with esbuild (minify, ESM, browser platform,
- * `node:*` external), gzips the result, and compares both numbers against the
- * committed budget (`scripts/bundle-size.budget.json`). Over budget → exit 1,
- * with the numbers and the re-baseline protocol in the error.
+ * dashboard-shaped import — with esbuild (minify, ESM, browser platform), gzips
+ * the result, and compares both numbers against the committed budget
+ * (`scripts/bundle-size.budget.json`). Over budget → exit 1, with the numbers
+ * and the re-baseline protocol in the error.
  *
  * Why esbuild and not the size-limit package family: esbuild is already in the
  * dependency tree (tsx's embedded binary — a transitive devDependency, so zero
@@ -16,11 +16,11 @@
  * nothing this repo needs; the argued decision lives in the PR and in
  * `.github/workflows/ci.yml`'s check step.
  *
- * Why `node:*` is external: the SDK imports `node:crypto`; in a real browser
- * bundle the consumer's bundler (Next.js/webpack/vite) supplies the polyfill
- * and would dominate the measurement with a choice this repo does not control.
- * Externalizing builtins measures the SDK's own contribution — the part a
- * version bump of this package actually changes.
+ * Why `node:*` is not external: the root entry is browser-safe (issue #325),
+ * so a real browser bundle must resolve without any Node built-in. Leaving
+ * them external would let a regression pass this check and only fail in a
+ * consumer's bundler; `scripts/check-browser-entry.mjs` is the explicit gate
+ * for that property.
  *
  * Usage:
  *   node scripts/check-bundle-size.mjs            # compare against the budget
@@ -43,7 +43,6 @@ const result = await build({
   minify: true,
   format: "esm",
   platform: "browser",
-  external: ["node:*"],
   write: false,
   metafile: true,
   logLevel: "silent",

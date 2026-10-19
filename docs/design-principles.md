@@ -194,13 +194,15 @@ browser-safe and a consumer opts into the Node-only surface by path. Today the o
 not in shipped code, and `verifyGuardWasm` itself hashes through WebCrypto
 (`globalThis.crypto.subtle`) so the same call runs in Node and the browser.
 
-**Current state, stated rather than hidden.** The root entry carries no filesystem,
-HTTP, or server code, but it is not yet entirely free of Node built-ins: three
-modules import `node:crypto` for SHA-256 (`createHash` in `src/preflight.ts:27`,
-`src/tx.ts:44`, `src/telemetry.ts:27`). That is a known gap against the browser
-target of this principle, recorded here instead of covered over. The direction
-remains: migrate those hashes to WebCrypto, and never add another Node-only import
-to a core module without the exception path below.
+**Current state, verified rather than claimed.** The root entry carries no
+filesystem, HTTP, or server code and imports no Node built-ins. SHA-256 for
+pre-flight cache fingerprints, auth-entry signing and telemetry ids goes through
+the Stellar SDK's browser-compatible hashing (`src/hash.ts`), so it is synchronous
+and needs no `node:crypto` or async WebCrypto boundary. `npm run test:browser`
+bundles the built root entry with esbuild for `platform: "browser"` and fails if
+any `node:*` input is reachable; a unit test runs the same check against
+`src/index.ts`. Never add another Node-only import to a core module without the
+exception path below.
 
 ### Rejected pattern
 

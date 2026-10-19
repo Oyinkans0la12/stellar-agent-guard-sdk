@@ -14,6 +14,7 @@
  */
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
 import { invoke, type InvokeOutcome } from "./invoke.ts";
+import { hexToBytes } from "./hash.ts";
 import { policyToScVal, type ContractAddress, type ReadonlyPolicyConfig } from "./policy.ts";
 import type { AdminSigner, ContractCall } from "./tx.ts";
 
@@ -33,14 +34,14 @@ export function agentPubkeyToScVal(newAgent: string | Uint8Array | Keypair): xdr
     if (newAgent.length !== 32) {
       throw new Error(`agent public key byte length must be 32, received ${newAgent.length}`);
     }
-    return xdr.ScVal.scvBytes(Buffer.from(newAgent));
+    return xdr.ScVal.scvBytes(Uint8Array.from(newAgent));
   }
   if (typeof newAgent === "string") {
     if (newAgent.startsWith("G") && newAgent.length === 56) {
-      return xdr.ScVal.scvBytes(Buffer.from(StrKey.decodeEd25519PublicKey(newAgent)));
+      return xdr.ScVal.scvBytes(StrKey.decodeEd25519PublicKey(newAgent));
     }
     if (/^[0-9a-fA-F]{64}$/.test(newAgent)) {
-      return xdr.ScVal.scvBytes(Buffer.from(newAgent, "hex"));
+      return xdr.ScVal.scvBytes(hexToBytes(newAgent));
     }
   }
   throw new Error(`invalid agent public key format for rotation: ${String(newAgent)}`);

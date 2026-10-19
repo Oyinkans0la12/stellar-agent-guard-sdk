@@ -575,7 +575,22 @@ const middleware = createLangChainGuardMiddleware({
 });
 ```
 
-The payload is the same on every adapter (`{ adapter, kind, reason, call, explanation }`): `kind` is `"blocked"` when the guard refused and `"undetermined"` when enforcement could not decide (in which case `reason` is `null` and `explanation` carries the failure detail — the halt still happens, because the adapter fails closed). The callback is called *after* the halt is decided and its errors are logged and swallowed, so a broken alerting sink can never turn a refusal into an executed action or a thrown error. Omit `onBlocked` for exactly the pre-existing behavior.
+The payload is the same on every adapter (`{ adapter, kind, reason, call, explanation }`): `kind` is `"blocked"` when the guard refused and `"undetermined"` when enforcement could not decide (in which case `reason` is `null` and `explanation` carries the failure detail — the halt still happens, because the adapter fails closed). The callback is called *after* the halt is decided and its errors are swallowed, so a broken alerting sink can never turn a refusal into an executed action or a thrown error. A swallowed hook failure is silent by default; pass `blockedHookLogger: { error(...) }` when you want that diagnostic. Omit `onBlocked` for exactly the pre-existing behavior.
+
+#### Ordered call batches (`toContractCalls`)
+
+A tool that performs several guarded contract calls can map the whole action with the additive `toContractCalls` mapper instead of `toContractCall`. The complete ordered batch is checked before the handler runs; if any call is blocked or undetermined, the action is refused and no handler side effect occurs (all-or-nothing). `onDecision` receives every per-call verdict in order, and a batch halt's `onBlocked` payload also carries `calls` and `verdicts`:
+
+```ts
+const middleware = createLangChainGuardMiddleware({
+  interceptor,
+  toContractCalls: (request) => [approveCall, swapCall],
+  onDecision: (_request, verdict) => report(verdict.kind),
+  onBlocked: ({ calls, verdicts }) => alert(`${verdicts.length} calls checked; refused`),
+});
+```
+
+`toContractCalls` returns `null` or `[]` for a tool that moves no funds, and takes precedence over `toContractCall` when both are supplied.
 
 > **ElizaOS note (0.2.x):** the ElizaOS adapter previously passed the raw `PreFlightDecision` to `onBlocked`; it now receives this structured payload, matching LangChain and MCP. Read `info.reason` / `info.explanation` (or `info.kind`) instead of `decision.reason` / `decision.explanation`.
 

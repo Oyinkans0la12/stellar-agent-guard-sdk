@@ -16,10 +16,18 @@ import { describe, it } from "node:test";
 import { createLangChainGuardMiddleware } from "../../src/adapters/langchain.ts";
 import { createGuardValidator, guardAction } from "../../src/adapters/elizaos.ts";
 import { guardMcpCallTool, guardMcpToolHandler } from "../../src/adapters/mcp.ts";
-import { runBlockedHook, type GuardBlockedInfo } from "../../src/adapters/shared.ts";
+import {
+  runBlockedHook,
+  type BlockedHookLogger,
+  type GuardBlockedInfo,
+} from "../../src/adapters/shared.ts";
 import { unsafeContractAddress } from "../../src/policy.ts";
 import { explainReason } from "../../src/reasons.ts";
-import type { PreFlightDecision, PreFlightInterceptor } from "../../src/preflight.ts";
+import type {
+  PreFlightBatchDecision,
+  PreFlightDecision,
+  PreFlightInterceptor,
+} from "../../src/preflight.ts";
 import type { ContractCall } from "../../src/tx.ts";
 
 const GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
@@ -88,7 +96,7 @@ describe("runBlockedHook isolation (issue #102)", () => {
     }
   });
 
-  it("logs and swallows a throwing hook instead of propagating it", () => {
+  it("stays silent by default when the hook throws (issue #314)", () => {
     const log = captureConsoleError();
     try {
       assert.doesNotThrow(() =>
@@ -105,8 +113,39 @@ describe("runBlockedHook isolation (issue #102)", () => {
           },
         ),
       );
-      assert.equal(log.calls.length, 1);
-      assert.match(String(log.calls[0]![0]), /elizaos adapter's onBlocked callback threw/);
+      assert.equal(log.calls.length, 0, "the SDK wrote to stderr without an explicit logger");
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("reports a throwing hook to an explicit logger and still swallows it", () => {
+    const log = captureConsoleError();
+    const reported: unknown[][] = [];
+    const logger: BlockedHookLogger = {
+      error: (...args) => {
+        reported.push(args);
+      },
+    };
+    try {
+      assert.doesNotThrow(() =>
+        runBlockedHook(
+          () => {
+            throw new Error("alerting sink is down");
+          },
+          {
+            adapter: "elizaos",
+            kind: "blocked",
+            reason: "paused",
+            call: transferCall(),
+            explanation: "paused",
+          },
+          logger,
+        ),
+      );
+      assert.equal(log.calls.length, 0);
+      assert.equal(reported.length, 1);
+      assert.match(String(reported[0]![0]), /elizaos adapter's onBlocked callback threw/);
     } finally {
       log.restore();
     }
@@ -117,12 +156,14 @@ describe("LangChain adapter onBlocked (issue #102)", () => {
   function wrap(
     decision: PreFlightDecision,
     onBlocked?: (info: GuardBlockedInfo) => void,
+    blockedHookLogger?: BlockedHookLogger,
   ) {
     let toolEntered = false;
     const middleware = createLangChainGuardMiddleware({
       interceptor: stub(decision),
       toContractCall: () => transferCall(),
       ...(onBlocked ? { onBlocked } : {}),
+      ...(blockedHookLogger ? { blockedHookLogger } : {}),
     });
     const settle = () =>
       middleware.wrapToolCall(
@@ -163,7 +204,7 @@ describe("LangChain adapter onBlocked (issue #102)", () => {
     assert.equal(infos[0]!.explanation, "rpc unreachable");
   });
 
-  it("swallows a throwing hook: the refusal is returned unchanged and logged", async () => {
+  it("swallows a throwing hook: the refusal is returned unchanged and stays silent", async () => {
     const log = captureConsoleError();
     try {
       const { settle } = wrap(BLOCKED, () => {
@@ -172,11 +213,31 @@ describe("LangChain adapter onBlocked (issue #102)", () => {
       const result = await settle();
       assert.ok("status" in result && result.status === "error");
       assert.match(String((result as { content: string }).content), /per_tx_cap_exceeded/);
-      assert.equal(log.calls.length, 1);
-      assert.match(String(log.calls[0]![0]), /langchain adapter's onBlocked callback threw/);
+      assert.equal(log.calls.length, 0);
     } finally {
       log.restore();
     }
+  });
+
+  it("reports a throwing hook to an explicit blockedHookLogger", async () => {
+    const reported: unknown[][] = [];
+    const logger: BlockedHookLogger = {
+      error: (...args) => {
+        reported.push(args);
+      },
+    };
+    const { settle, wasToolEntered } = wrap(
+      BLOCKED,
+      () => {
+        throw new Error("webhook down");
+      },
+      logger,
+    );
+    const result = await settle();
+    assert.equal(wasToolEntered(), false);
+    assert.ok("status" in result && result.status === "error");
+    assert.equal(reported.length, 1);
+    assert.match(String(reported[0]![0]), /langchain adapter's onBlocked callback threw/);
   });
 
   it("behaves exactly as before when no hook is configured", async () => {
@@ -217,7 +278,7 @@ describe("ElizaOS adapter onBlocked (issue #102)", () => {
     assert.equal(infos[0]!.call.fn, "transfer");
   });
 
-  it("does not let a throwing hook change the false verdict", async () => {
+  it("does not let a throwing hook change the false verdict, and stays silent by default", async () => {
     const log = captureConsoleError();
     try {
       const validate = createGuardValidator({
@@ -228,11 +289,29 @@ describe("ElizaOS adapter onBlocked (issue #102)", () => {
         },
       });
       assert.equal(await validate({}, {}, {}), false);
-      assert.equal(log.calls.length, 1);
-      assert.match(String(log.calls[0]![0]), /elizaos adapter's onBlocked callback threw/);
+      assert.equal(log.calls.length, 0);
     } finally {
       log.restore();
     }
+  });
+
+  it("reports a throwing hook to an explicit blockedHookLogger", async () => {
+    const reported: unknown[][] = [];
+    const validate = createGuardValidator({
+      interceptor: stub(BLOCKED),
+      toContractCall: () => transferCall(),
+      onBlocked: () => {
+        throw new Error("sink down");
+      },
+      blockedHookLogger: {
+        error: (...args) => {
+          reported.push(args);
+        },
+      },
+    });
+    assert.equal(await validate({}, {}, {}), false);
+    assert.equal(reported.length, 1);
+    assert.match(String(reported[0]![0]), /elizaos adapter's onBlocked callback threw/);
   });
 
   it("keeps the pre-existing behavior with no hook configured", async () => {
@@ -350,7 +429,7 @@ describe("MCP adapter (issue #45)", () => {
     assert.ok(!("isError" in result) || result.isError !== true);
   });
 
-  it("swallows a throwing MCP hook and still returns the refusal result", async () => {
+  it("swallows a throwing MCP hook, returns the refusal, and stays silent by default", async () => {
     const log = captureConsoleError();
     try {
       const guarded = guardMcpToolHandler(
@@ -366,10 +445,170 @@ describe("MCP adapter (issue #45)", () => {
       );
       const result = await guarded({});
       assert.ok("isError" in result && result.isError === true);
-      assert.equal(log.calls.length, 1);
-      assert.match(String(log.calls[0]![0]), /mcp adapter's onBlocked callback threw/);
+      assert.equal(log.calls.length, 0);
     } finally {
       log.restore();
     }
+  });
+
+  it("reports a throwing MCP hook to an explicit blockedHookLogger", async () => {
+    const reported: unknown[][] = [];
+    const guarded = guardMcpToolHandler(
+      "transfer_tokens",
+      async () => ({ content: [{ type: "text", text: "sent" }] }),
+      {
+        interceptor: stub(BLOCKED),
+        toContractCall: () => transferCall(),
+        onBlocked: () => {
+          throw new Error("boom");
+        },
+        blockedHookLogger: {
+          error: (...args) => {
+            reported.push(args);
+          },
+        },
+      },
+    );
+    const result = await guarded({});
+    assert.ok("isError" in result && result.isError === true);
+    assert.equal(reported.length, 1);
+    assert.match(String(reported[0]![0]), /mcp adapter's onBlocked callback threw/);
+  });
+});
+
+/**
+ * Ordered batch mapping (issue #318).
+ *
+ * The adapters expose an additive `toContractCalls` mapper: every call in the
+ * action's ordered batch is checked before the handler runs, and one refusal
+ * anywhere in the batch must prevent *all* handler side effects. These tests
+ * pin the all-or-nothing property and the per-call verdict reporting.
+ */
+describe("ordered call-batch mapping (issue #318)", () => {
+  function batchStub(verdicts: PreFlightDecision[]): PreFlightInterceptor {
+    return {
+      check: async () => {
+        throw new Error("single-call check must not be used for a mapped batch");
+      },
+      checkBatch: async (): Promise<PreFlightBatchDecision> => ({
+        admissible: verdicts.every((verdict) => verdict.allowed),
+        overallAdmissible: verdicts.every((verdict) => verdict.allowed),
+        verdicts,
+        calls: verdicts,
+        totalEstimatedResourceFee: 0n,
+      }),
+    } as unknown as PreFlightInterceptor;
+  }
+
+  const SECOND_CALL: ContractCall = {
+    contract: GUARD,
+    fn: "transfer_from",
+    args: [],
+  };
+
+  it("LangChain: a later blocked call prevents every handler side effect and reports per-call verdicts", async () => {
+    const decisions: PreFlightDecision[] = [];
+    const blocked: GuardBlockedInfo[] = [];
+    let toolEntered = false;
+    const middleware = createLangChainGuardMiddleware({
+      interceptor: batchStub([ADMISSIBLE, BLOCKED]),
+      toContractCalls: () => [transferCall(), SECOND_CALL],
+      onDecision: (_request, decision) => decisions.push(decision),
+      onBlocked: (info) => blocked.push(info),
+    });
+
+    const result = await middleware.wrapToolCall(
+      { toolCall: { name: "batch_transfer", id: "call_batch", args: {} } },
+      async () => {
+        toolEntered = true;
+        return { content: "sent" };
+      },
+    );
+
+    assert.equal(toolEntered, false, "a later refused call must stop the whole action");
+    assert.ok("status" in result && result.status === "error");
+    assert.match(String((result as { content: string }).content), /per_tx_cap_exceeded/);
+    assert.deepEqual(
+      decisions.map((decision) => decision.kind),
+      ["admissible", "blocked"],
+      "every per-call verdict must be reported, in order",
+    );
+    assert.equal(blocked.length, 1);
+    assert.equal(blocked[0]!.call.fn, "transfer_from");
+    assert.equal(blocked[0]!.calls?.length, 2);
+    assert.equal(blocked[0]!.verdicts?.length, 2);
+    assert.equal(blocked[0]!.verdicts?.[1]?.kind, "blocked");
+  });
+
+  it("LangChain: an all-admissible batch enters the handler exactly once", async () => {
+    const decisions: PreFlightDecision[] = [];
+    let toolEntered = 0;
+    const middleware = createLangChainGuardMiddleware({
+      interceptor: batchStub([ADMISSIBLE, ADMISSIBLE]),
+      toContractCalls: () => [transferCall(), SECOND_CALL],
+      onDecision: (_request, decision) => decisions.push(decision),
+      onBlocked: () => {
+        throw new Error("no refusal in an admissible batch");
+      },
+    });
+
+    const result = await middleware.wrapToolCall(
+      { toolCall: { name: "batch_transfer", id: "call_batch", args: {} } },
+      async () => {
+        toolEntered += 1;
+        return { content: "sent" };
+      },
+    );
+
+    assert.deepEqual(result, { content: "sent" });
+    assert.equal(toolEntered, 1);
+    assert.equal(decisions.length, 2);
+  });
+
+  it("ElizaOS: a later blocked call returns false and reports both verdicts", async () => {
+    const decisions: PreFlightDecision[] = [];
+    const infos: GuardBlockedInfo[] = [];
+    const validate = createGuardValidator({
+      interceptor: batchStub([ADMISSIBLE, BLOCKED]),
+      toContractCalls: () => [transferCall(), SECOND_CALL],
+      onDecision: (decision) => decisions.push(decision),
+      onBlocked: (info) => infos.push(info),
+    });
+
+    assert.equal(await validate({}, {}, {}), false);
+    assert.deepEqual(
+      decisions.map((decision) => decision.kind),
+      ["admissible", "blocked"],
+    );
+    assert.equal(infos.length, 1);
+    assert.equal(infos[0]!.call.fn, "transfer_from");
+    assert.equal(infos[0]!.calls?.length, 2);
+  });
+
+  it("MCP: a later blocked call never invokes the tool and reports both verdicts", async () => {
+    const decisions: PreFlightDecision[] = [];
+    let handlerRan = false;
+    const guarded = guardMcpToolHandler(
+      "batch_transfer",
+      async () => {
+        handlerRan = true;
+        return { content: [{ type: "text", text: "sent" }] };
+      },
+      {
+        interceptor: batchStub([ADMISSIBLE, BLOCKED]),
+        toContractCalls: () => [transferCall(), SECOND_CALL],
+        onDecision: (_request, decision) => decisions.push(decision),
+      },
+    );
+
+    const result = await guarded({});
+
+    assert.equal(handlerRan, false);
+    assert.ok("isError" in result && result.isError === true);
+    assert.deepEqual(
+      decisions.map((decision) => decision.kind),
+      ["admissible", "blocked"],
+    );
+    assert.match(result.content[0]!.text ?? "", /per_tx_cap_exceeded/);
   });
 });

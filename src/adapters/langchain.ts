@@ -39,12 +39,21 @@ import type { PreFlightDecision, PreFlightInterceptor } from "../preflight.ts";
 import type { ContractCall } from "../tx.ts";
 import {
   throwAdapterConfigError,
+  validateBatchInterceptor,
+  validateBlockedHookLogger,
+  validateContractMapping,
   validateInterceptor,
   validateOptionalFunction,
-  validateRequiredFunction,
   type AdapterConfigIssue,
 } from "./validate.ts";
-import { blockedInfoFor, runBlockedHook, type GuardBlockedHook } from "./shared.ts";
+import {
+  blockedInfoFor,
+  blockedInfoForBatch,
+  mapContractCalls,
+  runBlockedHook,
+  type BlockedHookLogger,
+  type GuardBlockedHook,
+} from "./shared.ts";
 
 /** The subset of LangChain's `ToolCallRequest` this adapter reads. */
 export interface LangChainToolCallRequest {
@@ -70,7 +79,14 @@ export interface LangChainGuardOptions {
    * Turn a tool call into the guarded contract call it would make, or `null` if
    * this tool does not move funds and should not be intercepted at all.
    */
-  toContractCall: (request: LangChainToolCallRequest) => ContractCall | null;
+  toContractCall?: (request: LangChainToolCallRequest) => ContractCall | null;
+  /**
+   * Additive batch mapping (issue #318): the ordered calls one action performs.
+   * Supplying this takes precedence over `toContractCall`, and the entire batch
+   * is checked before the tool body runs (all-or-nothing). `null` or an empty
+   * array means the tool is not fund-moving.
+   */
+  toContractCalls?: (request: LangChainToolCallRequest) => readonly ContractCall[] | null;
   /** Middleware name; also the returned message's `name`. */
   name?: string;
   /** Observe every decision — the place to wire telemetry. */
@@ -85,6 +101,12 @@ export interface LangChainGuardOptions {
    * behavior. See `src/adapters/shared.ts`.
    */
   onBlocked?: GuardBlockedHook;
+  /**
+   * Explicit sink for a swallowed `onBlocked` failure. Omitted (the default),
+   * a throwing hook is silent — the SDK never writes to `console` on its own
+   * (issue #314).
+   */
+  blockedHookLogger?: BlockedHookLogger;
   /**
    * Optional per-call observability, forwarded to the interceptor's
    * `check()`: one event per enforcement-stage attempt (probe → sign →
@@ -126,8 +148,13 @@ export function createLangChainGuardMiddleware(options: LangChainGuardOptions) {
   const issues: AdapterConfigIssue[] = [];
   const interceptorIssue = validateInterceptor(options.interceptor);
   if (interceptorIssue) issues.push(interceptorIssue);
-  const toCallIssue = validateRequiredFunction("toContractCall", options.toContractCall);
-  if (toCallIssue) issues.push(toCallIssue);
+  issues.push(...validateContractMapping(options));
+  if (options.toContractCalls) {
+    const batchIssue = validateBatchInterceptor(options.interceptor);
+    if (batchIssue) issues.push(batchIssue);
+  }
+  const blockedLoggerIssue = validateBlockedHookLogger(options.blockedHookLogger);
+  if (blockedLoggerIssue) issues.push(blockedLoggerIssue);
   const nameIssue = validateOptionalFunction("name", options.name);
   if (nameIssue) issues.push(nameIssue);
   const onDecisionIssue = validateOptionalFunction("onDecision", options.onDecision);
@@ -144,27 +171,55 @@ export function createLangChainGuardMiddleware(options: LangChainGuardOptions) {
       request: LangChainToolCallRequest,
       handler: (request: LangChainToolCallRequest) => Promise<T>,
     ): Promise<T | LangChainToolMessage> {
-      const call = options.toContractCall(request);
-      if (!call) {
+      const calls = mapContractCalls(request, options);
+      if (calls.length === 0) {
         // Not a fund-moving tool. Pass through untouched rather than inventing a
         // verdict for something the guard has no opinion about.
         return handler(request);
       }
 
-      const decision = await options.interceptor.check(call, {
+      if (calls.length === 1) {
+        const decision = await options.interceptor.check(calls[0]!, {
+          ...(options.onStep ? { onStep: options.onStep } : {}),
+        });
+        options.onDecision?.(request, decision);
+        if (decision.allowed) return handler(request);
+
+        // Operator-facing half of the refusal, wired through the shared primitive
+        // so this adapter and ElizaOS cannot drift on the payload shape.
+        runBlockedHook(
+          options.onBlocked,
+          blockedInfoFor("langchain", calls[0]!, decision),
+          options.blockedHookLogger,
+        );
+
+        // The tool is never entered: no signing, no broadcast, no fee.
+        // Both `blocked` and `undetermined` fail closed to a refusal message.
+        return mapDecisionToLangChainResult(
+          decision,
+          request.toolCall.name,
+          name,
+          request.toolCall.id ?? "",
+        );
+      }
+
+      // Batch mapping: check every call before entering the tool. The interceptor
+      // reports one verdict per call in order; a single non-admissible verdict
+      // refuses the whole action (all-or-nothing).
+      const batch = await options.interceptor.checkBatch(calls, {
         ...(options.onStep ? { onStep: options.onStep } : {}),
       });
-      options.onDecision?.(request, decision);
-      if (decision.allowed) return handler(request);
+      for (const verdict of batch.verdicts) options.onDecision?.(request, verdict);
+      if (batch.admissible) return handler(request);
 
-      // Operator-facing half of the refusal, wired through the shared primitive
-      // so this adapter and ElizaOS cannot drift on the payload shape.
-      runBlockedHook(options.onBlocked, blockedInfoFor("langchain", call, decision));
-
-      // The tool is never entered: no signing, no broadcast, no fee.
-      // Both `blocked` and `undetermined` fail closed to a refusal message.
+      runBlockedHook(
+        options.onBlocked,
+        blockedInfoForBatch("langchain", calls, batch.verdicts),
+        options.blockedHookLogger,
+      );
+      const refusal = batch.verdicts.find((verdict) => !verdict.allowed)!;
       return mapDecisionToLangChainResult(
-        decision,
+        refusal,
         request.toolCall.name,
         name,
         request.toolCall.id ?? "",

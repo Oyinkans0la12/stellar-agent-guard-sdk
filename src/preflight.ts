@@ -24,8 +24,8 @@
  * A refused call never has a transaction hash. That is not a gap in the
  * evidence: the block happens before broadcast, which is what makes it free.
  */
-import { createHash } from "node:crypto";
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
+import { concatBytes, sha256Hex, utf8Bytes } from "./hash.ts";
 import { GuardError, SimulationError } from "./errors.ts";
 import { enforceCall, RpcTimeoutError, timeoutOutcome, withRpcAbort } from "./invoke.ts";
 import { resourceBreakdownFromSimulation, type ResourceBreakdown } from "./cost.ts";
@@ -230,6 +230,18 @@ export interface CheckBatchOptions {
    * If omitted, attempts to fetch it from the guard's `Window` ledger entry (defaults to 0n).
    */
   initialWindowSpent?: bigint;
+
+  /**
+   * Optional per-call observability, forwarded to each call's `check()`:
+   * one event per enforcement-stage attempt, in call order.
+   */
+  onStep?: (step: InvokeStepEvent) => void;
+
+  /** Caller-owned cancellation, forwarded to every call's `check()`. */
+  signal?: AbortSignal | undefined;
+
+  /** Per-RPC timeout, forwarded to every call's `check()`. */
+  timeoutMs?: number | undefined;
 }
 
 export interface PreFlightBatchDecision {
@@ -373,32 +385,31 @@ function policyRevisionToken(revision: PolicyRevision): string {
   return `${typeof revision}:${String(revision)}`;
 }
 
-function hashPart(hash: ReturnType<typeof createHash>, value: string | Uint8Array): void {
-  const bytes = typeof value === "string" ? Buffer.from(value) : Buffer.from(value);
-  const length = Buffer.alloc(4);
-  length.writeUInt32BE(bytes.length);
-  hash.update(length);
-  hash.update(bytes);
+function hashPart(parts: Uint8Array[], value: string | Uint8Array): void {
+  const bytes = typeof value === "string" ? utf8Bytes(value) : value;
+  const length = new Uint8Array(4);
+  new DataView(length.buffer).setUint32(0, bytes.length, false);
+  parts.push(length, bytes);
 }
 
 function callFingerprint(call: ContractCall): string {
-  const hash = createHash("sha256");
-  hashPart(hash, call.contract);
-  hashPart(hash, call.fn);
-  for (const arg of call.args) hashPart(hash, arg.toXDR());
-  return hash.digest("hex");
+  const parts: Uint8Array[] = [];
+  hashPart(parts, call.contract);
+  hashPart(parts, call.fn);
+  for (const arg of call.args) hashPart(parts, arg.toXDR());
+  return sha256Hex(concatBytes(parts));
 }
 
 function configFingerprint(config: PreFlightConfig): string {
-  const hash = createHash("sha256");
-  hashPart(hash, config.networkPassphrase);
-  hashPart(hash, config.guard);
-  hashPart(hash, config.source.publicKey());
-  hashPart(hash, toAgentSigner(config.agent).publicKey);
+  const parts: Uint8Array[] = [];
+  hashPart(parts, config.networkPassphrase);
+  hashPart(parts, config.guard);
+  hashPart(parts, config.source.publicKey());
+  hashPart(parts, toAgentSigner(config.agent).publicKey);
   for (const signer of (config.accountSigners ?? []).map((keypair) => keypair.publicKey()).sort()) {
-    hashPart(hash, signer);
+    hashPart(parts, signer);
   }
-  return hash.digest("hex");
+  return sha256Hex(concatBytes(parts));
 }
 
 export class PreFlightInterceptor {
@@ -719,8 +730,14 @@ export class PreFlightInterceptor {
     let totalEstimatedResourceFee = 0n;
     const verdicts: PreFlightDecision[] = [];
 
+    const checkOptions: PreFlightCheckOptions = {
+      ...(options?.onStep ? { onStep: options.onStep } : {}),
+      ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    };
+
     for (const call of calls) {
-      const decision = await this.check(call);
+      const decision = await this.check(call, checkOptions);
 
       if (decision.kind === "admissible") {
         const amount = extractTransferAmount(call);

@@ -32,6 +32,7 @@ import { GuardBlockedError } from "../reasons.ts";
 import { PreFlightUndeterminedError } from "../preflight.ts";
 import type { PreFlightDecision, PreFlightInterceptor } from "../preflight.ts";
 import type { ContractCall } from "../tx.ts";
+import { mapContractCalls } from "./shared.ts";
 
 /**
  * The subset of the Vercel AI SDK's `Tool` interface this adapter reads.
@@ -57,7 +58,13 @@ export interface VercelAIGuardOptions {
    * Turn a tool call into the guarded contract call it would make, or `null`
    * when this tool moves no funds and should not be intercepted at all.
    */
-  toContractCall: (call: VercelAIToolCallInput) => ContractCall | null;
+  toContractCall?: (call: VercelAIToolCallInput) => ContractCall | null;
+  /**
+   * Additive batch mapping (issue #318): the ordered calls this tool performs.
+   * Takes precedence over `toContractCall`; the whole batch is checked before
+   * `execute` runs (all-or-nothing).
+   */
+  toContractCalls?: (call: VercelAIToolCallInput) => readonly ContractCall[] | null;
   /** Observe every decision — the place to wire telemetry. */
   onDecision?: (call: VercelAIToolCallInput, decision: PreFlightDecision) => void;
 }
@@ -79,25 +86,45 @@ export function wrapToolWithGuard<T extends VercelAIToolLike>(
   return {
     ...tool,
     async execute(input: never, toolOptions: unknown): Promise<unknown> {
-      const contractCall = options.toContractCall({ toolName: call.toolName, input });
-      if (!contractCall) return execute(input, toolOptions);
+      const request = { toolName: call.toolName, input };
+      const contractCalls = mapContractCalls(request, options);
+      if (contractCalls.length === 0) return execute(input, toolOptions);
 
-      const decision = await options.interceptor.check(contractCall);
-      options.onDecision?.({ toolName: call.toolName, input }, decision);
-      if (decision.allowed) return execute(input, toolOptions);
-
-      if (decision.kind === "blocked") {
-        throw new GuardBlockedError({
-          reason: decision.reason,
-          stage: "preflight",
-          detail: decision.detail,
-          call: contractCall,
-          rawEvent: decision.diagnosticEvents?.[0],
-        });
+      if (contractCalls.length === 1) {
+        const decision = await options.interceptor.check(contractCalls[0]!);
+        options.onDecision?.(request, decision);
+        if (decision.allowed) return execute(input, toolOptions);
+        throw refusalFor(decision, contractCalls[0]!);
       }
-      throw new PreFlightUndeterminedError(decision.detail, { cause: decision.error });
+
+      // Batch mapping: only an all-admissible batch reaches `execute`.
+      const batch = await options.interceptor.checkBatch(contractCalls);
+      for (const verdict of batch.verdicts) options.onDecision?.(request, verdict);
+      if (batch.admissible) return execute(input, toolOptions);
+
+      const index = batch.verdicts.findIndex((verdict) => !verdict.allowed);
+      const refusal = batch.verdicts[index]!;
+      if (refusal.allowed) throw new Error("non-admissible batch had no refusal verdict");
+      throw refusalFor(refusal, contractCalls[index] ?? contractCalls[0]!);
     },
   };
+}
+
+/** Throw the documented error for a non-admissible verdict. */
+function refusalFor(
+  decision: PreFlightDecision & { allowed: false },
+  contractCall: ContractCall,
+): Error {
+  if (decision.kind === "blocked") {
+    return new GuardBlockedError({
+      reason: decision.reason,
+      stage: "preflight",
+      detail: decision.detail,
+      call: contractCall,
+      rawEvent: decision.diagnosticEvents?.[0],
+    });
+  }
+  return new PreFlightUndeterminedError(decision.detail, { cause: decision.error });
 }
 
 /**

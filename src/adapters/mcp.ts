@@ -27,7 +27,14 @@
 import type { InvokeStepEvent } from "../invoke.ts";
 import type { PreFlightDecision, PreFlightInterceptor } from "../preflight.ts";
 import type { ContractCall } from "../tx.ts";
-import { blockedInfoFor, runBlockedHook, type GuardBlockedHook } from "./shared.ts";
+import {
+  blockedInfoFor,
+  blockedInfoForBatch,
+  mapContractCalls,
+  runBlockedHook,
+  type BlockedHookLogger,
+  type GuardBlockedHook,
+} from "./shared.ts";
 
 /** The one field of a tool call this adapter reads. */
 export interface McpToolCallRequest {
@@ -64,7 +71,14 @@ export interface McpGuardOptions {
    * Turn a tool call into the guarded contract call it would make, or `null` if
    * this tool moves no funds and should not be intercepted at all.
    */
-  toContractCall: (request: McpToolCallRequest) => ContractCall | null;
+  toContractCall?: (request: McpToolCallRequest) => ContractCall | null;
+  /**
+   * Additive batch mapping (issue #318): the ordered calls this tool performs.
+   * Takes precedence over `toContractCall`; the whole batch is checked before
+   * the handler runs (all-or-nothing). `null` or an empty array means the tool
+   * is not fund-moving.
+   */
+  toContractCalls?: (request: McpToolCallRequest) => readonly ContractCall[] | null;
   /** Observe every decision — the place to wire telemetry. */
   onDecision?: (request: McpToolCallRequest, decision: PreFlightDecision) => void;
   /**
@@ -73,6 +87,11 @@ export interface McpGuardOptions {
    * callback is logged and swallowed; omit it for the pre-existing behavior.
    */
   onBlocked?: GuardBlockedHook;
+  /**
+   * Explicit sink for a swallowed `onBlocked` failure. Omitted (the default),
+   * a throwing hook is silent (issue #314).
+   */
+  blockedHookLogger?: BlockedHookLogger;
   /**
    * Optional per-call observability, forwarded to the interceptor's `check()`:
    * one event per enforcement-stage attempt (probe → sign → simulate). The
@@ -94,18 +113,43 @@ async function guardMcpRequest<T extends McpToolResult>(
   proceed: () => Promise<T>,
   options: McpGuardOptions,
 ): Promise<T | McpToolResult> {
-  const call = options.toContractCall(request);
-  if (!call) return proceed();
+  const calls = mapContractCalls(request, options);
+  if (calls.length === 0) return proceed();
 
-  const decision = await options.interceptor.check(call, {
+  if (calls.length === 1) {
+    const decision = await options.interceptor.check(calls[0]!, {
+      ...(options.onStep ? { onStep: options.onStep } : {}),
+    });
+    options.onDecision?.(request, decision);
+    if (decision.allowed) return proceed();
+
+    runBlockedHook(
+      options.onBlocked,
+      blockedInfoFor("mcp", calls[0]!, decision),
+      options.blockedHookLogger,
+    );
+    return {
+      content: [{ type: "text", text: describeMcpRefusal(decision, request.name) }],
+      isError: true,
+    };
+  }
+
+  // Batch mapping: report every per-call verdict, and refuse the whole action if
+  // any call is blocked or undetermined (all-or-nothing).
+  const batch = await options.interceptor.checkBatch(calls, {
     ...(options.onStep ? { onStep: options.onStep } : {}),
   });
-  options.onDecision?.(request, decision);
-  if (decision.allowed) return proceed();
+  for (const verdict of batch.verdicts) options.onDecision?.(request, verdict);
+  if (batch.admissible) return proceed();
 
-  runBlockedHook(options.onBlocked, blockedInfoFor("mcp", call, decision));
+  runBlockedHook(
+    options.onBlocked,
+    blockedInfoForBatch("mcp", calls, batch.verdicts),
+    options.blockedHookLogger,
+  );
+  const refusal = batch.verdicts.find((verdict) => !verdict.allowed)!;
   return {
-    content: [{ type: "text", text: describeMcpRefusal(decision, request.name) }],
+    content: [{ type: "text", text: describeMcpRefusal(refusal, request.name) }],
     isError: true,
   };
 }

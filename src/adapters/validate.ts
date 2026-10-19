@@ -63,6 +63,49 @@ export function validateOptionalFunction(
   };
 }
 
+/**
+ * A call-mapping pair: at least one of the single or batch form is required.
+ *
+ * The batch form is additive (issue #318), so `toContractCall` is no longer
+ * mandatory on its own; either mapper satisfies the requirement, and supplying
+ * both is valid (`toContractCalls` takes precedence).
+ */
+export function validateContractMapping(options: {
+  toContractCall?: unknown;
+  toContractCalls?: unknown;
+}): AdapterConfigIssue[] {
+  if (options.toContractCall === undefined && options.toContractCalls === undefined) {
+    return [
+      {
+        field: "toContractCall",
+        expected: "a function, or a `toContractCalls` batch mapper",
+        message:
+          "`toContractCall` or `toContractCalls` is required; supply one to map the action " +
+          "to the guarded contract call(s).",
+      },
+    ];
+  }
+  const issues: AdapterConfigIssue[] = [];
+  const single = validateOptionalFunction("toContractCall", options.toContractCall);
+  if (single) issues.push(single);
+  const batch = validateOptionalFunction("toContractCalls", options.toContractCalls);
+  if (batch) issues.push(batch);
+  return issues;
+}
+
+/** An optional explicit sink for a swallowed `onBlocked` failure. */
+export function validateBlockedHookLogger(value: unknown): AdapterConfigIssue | undefined {
+  if (value === undefined) return undefined;
+  if (typeof (value as { error?: unknown } | null)?.error === "function") return undefined;
+  return {
+    field: "blockedHookLogger",
+    expected: "an object exposing an `error(message, ...rest)` method when provided",
+    message:
+      "`blockedHookLogger` must be an object exposing an `error(message, ...rest)` method " +
+      `when provided (got ${describeValue(value)}).`,
+  };
+}
+
 /** An interceptor, duck-typed on the `check(...)` method the adapters call. */
 export function validateInterceptor(value: unknown): AdapterConfigIssue | undefined {
   const candidate = value as { check?: unknown } | null | undefined;
@@ -73,6 +116,22 @@ export function validateInterceptor(value: unknown): AdapterConfigIssue | undefi
     message:
       "`interceptor` is required and must be a PreFlightInterceptor " +
       "(an object exposing a `check(...)` method).",
+  };
+}
+
+/**
+ * A batch-capable interceptor: the adapters call `checkBatch(...)` when a
+ * `toContractCalls` mapper produces more than one call.
+ */
+export function validateBatchInterceptor(value: unknown): AdapterConfigIssue | undefined {
+  const candidate = value as { checkBatch?: unknown } | null | undefined;
+  if (candidate != null && typeof candidate.checkBatch === "function") return undefined;
+  return {
+    field: "interceptor",
+    expected: "an object exposing a `checkBatch(...)` method when `toContractCalls` is used",
+    message:
+      "`interceptor` must expose a `checkBatch(...)` method when `toContractCalls` is used " +
+      "(a PreFlightInterceptor does).",
   };
 }
 
