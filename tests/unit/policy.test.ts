@@ -652,6 +652,175 @@ describe("describePolicy", () => {
   });
 });
 
+/**
+ * The advanced constraints in the operator-facing summary (issue #343).
+ *
+ * A summary that omits the blocklist, the per-recipient caps and the active
+ * window can describe a narrow policy as broadly permissive. These tests pin
+ * the three properties that matter: the constraints are *present*, the
+ * recipient lists are *quiet by default*, and the output is *stable*.
+ */
+describe("describePolicy advanced constraints (issue #343)", () => {
+  const OTHER_RECIPIENT = unsafeAccountAddress(
+    "GB25CRKTZNLCD4672INIEIOMT72SIIMAOAKCQJYBMRSCTYYLDIBMSNIT",
+  );
+  const THIRD_RECIPIENT = unsafeAccountAddress(
+    "GBJ3BE7AFANC3D2CO23X7UQ6GOALGMU7BEEXVTR5TZQM6DZPSA46ETDE",
+  );
+
+  it("says nothing about a constraint the policy does not carry", () => {
+    const text = describePolicy(samplePolicy());
+    assert.ok(!text.includes("blocked recipient"), "no blocklist was configured");
+    assert.ok(!text.includes("window cap"), "no per-recipient cap was configured");
+    assert.match(text, /no active window/);
+  });
+
+  it("treats an empty list exactly like an absent one", () => {
+    const absent = describePolicy(samplePolicy());
+    const empty = describePolicy(
+      samplePolicy({ blocked_recipients: [], recipient_window_caps: [] }),
+    );
+    assert.equal(empty, absent, "an empty constraint imposes nothing, so it says nothing");
+  });
+
+  it("reports the recipient constraints as counts, not as addresses", () => {
+    const text = describePolicy(
+      samplePolicy({
+        blocked_recipients: [OTHER_RECIPIENT, THIRD_RECIPIENT],
+        recipient_window_caps: [{ recipient: RECIPIENT, cap: 50n }],
+      }),
+    );
+    assert.match(text, /2 blocked recipient\(s\)/);
+    assert.match(text, /1 per-recipient window cap\(s\)/);
+    assert.ok(
+      !text.includes(OTHER_RECIPIENT) && !text.includes(THIRD_RECIPIENT),
+      "the default summary must not print the recipient lists",
+    );
+  });
+
+  it("prints the recipient lists when the caller asks for the detail", () => {
+    const text = describePolicy(
+      samplePolicy({
+        blocked_recipients: [OTHER_RECIPIENT, THIRD_RECIPIENT],
+        recipient_window_caps: [{ recipient: RECIPIENT, cap: 50n }],
+      }),
+      { detail: true },
+    );
+    assert.match(text, /blocked recipients: /);
+    assert.ok(text.includes(OTHER_RECIPIENT), "the detail option names the blocked recipients");
+    assert.ok(text.includes(RECIPIENT), "and the capped recipient");
+    assert.match(text, /per-recipient window caps: /);
+    assert.match(text, /50/);
+  });
+
+  it("keeps the detail output stable: the same policy always renders the same way", () => {
+    const policy = samplePolicy({
+      blocked_recipients: [THIRD_RECIPIENT, OTHER_RECIPIENT],
+      recipient_window_caps: [
+        { recipient: THIRD_RECIPIENT, cap: 10n },
+        { recipient: OTHER_RECIPIENT, cap: 20n },
+      ],
+    });
+    const first = describePolicy(policy, { detail: true, nowSecs: 1_000 });
+    const second = describePolicy(policy, { detail: true, nowSecs: 1_000 });
+    assert.equal(first, second, "the same policy renders the same summary");
+
+    // The lists are sorted, so a policy that lists them in another order
+    // renders identically.
+    const reordered = samplePolicy({
+      blocked_recipients: [OTHER_RECIPIENT, THIRD_RECIPIENT],
+      recipient_window_caps: [
+        { recipient: OTHER_RECIPIENT, cap: 20n },
+        { recipient: THIRD_RECIPIENT, cap: 10n },
+      ],
+    });
+    assert.equal(
+      describePolicy(reordered, { detail: true, nowSecs: 1_000 }),
+      first,
+      "the order the policy stores the lists in does not change the summary",
+    );
+  });
+
+  it("orders the per-recipient caps deterministically, even for one recipient", () => {
+    const text = describePolicy(
+      samplePolicy({
+        recipient_window_caps: [
+          { recipient: RECIPIENT, cap: 30n },
+          { recipient: RECIPIENT, cap: 10n },
+          { recipient: RECIPIENT, cap: 20n },
+          { recipient: RECIPIENT, cap: 10n },
+        ],
+      }),
+      { detail: true, nowSecs: 1 },
+    );
+    assert.match(
+      text,
+      /per-recipient window caps: \S+ -> 10, \S+ -> 10, \S+ -> 20, \S+ -> 30/,
+      "the caps are ordered by recipient, then by cap",
+    );
+  });
+
+  it("reports the dead-man grace window when the switch is on", () => {
+    assert.match(describePolicy(samplePolicy({ dms_grace_secs: 300n })), /dead-man grace 300s/);
+  });
+
+  it("reports an open active window as active", () => {
+    const text = describePolicy(
+      samplePolicy({ active_from: 1_000n, active_until: 2_000n }),
+      { nowSecs: 1_500 },
+    );
+    assert.match(text, /active window .* -> .*\(active\)/);
+    assert.match(text, /1970-01-01T00:16:40.000Z/, "the start bound is rendered as a timestamp");
+  });
+
+  it("reports a window that has not opened yet", () => {
+    const text = describePolicy(
+      samplePolicy({ active_from: 2_000n, active_until: 3_000n }),
+      { nowSecs: 1_500 },
+    );
+    assert.match(text, /\(scheduled\)/);
+  });
+
+  it("reports a window that has closed", () => {
+    const text = describePolicy(
+      samplePolicy({ active_from: 1_000n, active_until: 2_000n }),
+      { nowSecs: 2_000 },
+    );
+    assert.match(text, /\(expired\)/);
+  });
+
+  it("reports a one-sided window: it never expires", () => {
+    const text = describePolicy(samplePolicy({ active_from: 1_000n }), { nowSecs: 5_000 });
+    assert.match(text, /active window .* -> never \(active\)/);
+  });
+
+  it("reports a window with no start: it was always open", () => {
+    const text = describePolicy(samplePolicy({ active_until: 2_000n }), { nowSecs: 1_500 });
+    assert.match(text, /active window always -> .*\(active\)/);
+  });
+
+  it("judges the window against an injected moment, not the wall clock", () => {
+    const policy = samplePolicy({ active_from: 1_000n, active_until: 2_000n });
+    assert.match(describePolicy(policy, { nowSecs: 1_500 }), /\(active\)/);
+    assert.match(describePolicy(policy, { nowSecs: 2_500n }), /\(expired\)/);
+  });
+
+  it("renders a boundary a Date cannot represent as raw seconds", () => {
+    const text = describePolicy(
+      samplePolicy({ active_from: 0n, active_until: 9_007_199_254_740_991n }),
+      { nowSecs: 1 },
+    );
+    assert.match(text, /9007199254740991s/, "an unrepresentable instant does not throw");
+  });
+
+  it("rejects a non-finite moment", () => {
+    assert.throws(
+      () => describePolicy(samplePolicy(), { nowSecs: Number.POSITIVE_INFINITY }),
+      RangeError,
+    );
+  });
+});
+
 describe("address decoding", () => {
   it("round-trips a contract address through Address", () => {
     assert.equal(new Address(TOKEN).toString(), TOKEN);

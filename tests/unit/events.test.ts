@@ -15,6 +15,7 @@ import {
   decodeAuthDecision,
   decodeGuardEventXdr,
   normalizeU64,
+  validateGuardEventXdr,
 } from "../../src/events.ts";
 
 /** Build the base64 `ContractEvent` XDR a block explorer hands over. */
@@ -327,5 +328,125 @@ describe("decodeGuardEventXdr", () => {
   it("agrees with the object-path decode for the same event", () => {
     const topics = [GUARD_EVENT_TOPICS.authChecked, GUARD_AUTH_RESULTS.blocked, "window_cap_exceeded"];
     assert.deepEqual(decodeGuardEventXdr(contractEventXdr(topics)), decodeAuthDecision(topics, "diagnostic"));
+  });
+});
+
+
+describe("validateGuardEventXdr (strict offline validation)", () => {
+  it("reports malformed XDR and unknown topics by input index and stage, keeping valid neighbours", () => {
+    const allowed = contractEventXdr([
+      GUARD_EVENT_TOPICS.authChecked,
+      GUARD_AUTH_RESULTS.allowed,
+      "",
+    ]);
+    const blocked = contractEventXdr([
+      GUARD_EVENT_TOPICS.authChecked,
+      GUARD_AUTH_RESULTS.blocked,
+      "paused",
+    ]);
+    const unknownTopic = contractEventXdr(["fn_call", "transfer"]);
+
+    const report = validateGuardEventXdr([allowed, "!!!not-base64!!!", unknownTopic, blocked]);
+
+    assert.equal(report.ok, false, "any rejected input makes the report fail");
+    assert.deepEqual(
+      report.results.map((result) => [result.index, result.ok, result.ok ? null : result.stage]),
+      [
+        [0, true, null],
+        [1, false, "xdr"],
+        [2, false, "decision"],
+        [3, true, null],
+      ],
+      "every input is accounted for, in input order",
+    );
+    assert.deepEqual(
+      report.failures.map((failure) => ({
+        index: failure.index,
+        path: failure.path,
+        stage: failure.stage,
+        code: failure.code,
+      })),
+      [
+        { index: 1, path: "events[1]", stage: "xdr", code: "xdr.unparseable" },
+        {
+          index: 2,
+          path: "events[2].topics[0]",
+          stage: "decision",
+          code: "decision.unknown_topic",
+        },
+      ],
+      "failure paths are stable and identify the exact event and field",
+    );
+    assert.deepEqual(report.events, [
+      { result: "allowed", reason: null, source: "diagnostic" },
+      { result: "blocked", reason: "paused", source: "diagnostic" },
+    ]);
+  });
+
+  it("reports an invalid decision result at the result-topic path", () => {
+    const invalid = contractEventXdr([
+      GUARD_EVENT_TOPICS.authChecked,
+      "maybe",
+      "paused",
+    ]);
+
+    const report = validateGuardEventXdr([invalid]);
+
+    assert.equal(report.ok, false);
+    assert.deepEqual(report.failures, [
+      {
+        index: 0,
+        path: "events[0].topics[1]",
+        stage: "decision",
+        code: "decision.invalid_result",
+        message: report.failures[0]!.message,
+      },
+    ]);
+  });
+
+  it("applies the requested source and path without changing the live decoder", () => {
+    const payload = contractEventXdr([
+      GUARD_EVENT_TOPICS.authChecked,
+      GUARD_AUTH_RESULTS.allowed,
+      "",
+    ]);
+
+    const report = validateGuardEventXdr([payload], { source: "ledger", path: "fixtures" });
+
+    assert.equal(report.ok, true);
+    assert.deepEqual(report.events, [{ result: "allowed", reason: null, source: "ledger" }]);
+    assert.equal(report.results[0]?.path, "fixtures[0]");
+    assert.deepEqual(decodeGuardEventXdr(payload), {
+      result: "allowed",
+      reason: null,
+      source: "diagnostic",
+    });
+  });
+
+  it("rejects non-string and empty inputs at the input stage", () => {
+    const report = validateGuardEventXdr([null, "", 42]);
+
+    assert.deepEqual(
+      report.failures.map((failure) => [failure.index, failure.stage, failure.code]),
+      [
+        [0, "input", "input.not_string"],
+        [1, "input", "input.empty"],
+        [2, "input", "input.not_string"],
+      ],
+    );
+    assert.equal(report.ok, false);
+  });
+
+  it("returns a stable report when the same fixture is validated twice", () => {
+    const valid = contractEventXdr([
+      GUARD_EVENT_TOPICS.authChecked,
+      GUARD_AUTH_RESULTS.blocked,
+      "paused",
+    ]);
+
+    assert.deepEqual(
+      validateGuardEventXdr([valid, "broken"]),
+      validateGuardEventXdr([valid, "broken"]),
+    );
   });
 });

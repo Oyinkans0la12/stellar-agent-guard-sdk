@@ -163,14 +163,24 @@ function topicToSymbol(topic: unknown): string | null {
   }
 }
 
+/** The outcome of inspecting an event's topic list, for resilient and strict decoders. */
+type TopicInspection =
+  | { ok: true; topics: string[] }
+  | {
+      ok: false;
+      stage: "topics" | "topic";
+      topicIndex: number | null;
+      message: string;
+    };
+
 /**
- * Pull the topic list out of a decoded `xdr.ContractEvent` or
- * `xdr.DiagnosticEvent`.
+ * Inspect an event's topic list while keeping the precise failure stage.
  *
- * A `DiagnosticEvent` wraps the contract event in its `event` field; a
- * `ContractEvent` carries `body.v0.topics` directly.
+ * The resilient `topicsFromEvent()` below collapses this to `null`; the strict
+ * offline validator needs to say whether the list was missing or one individual
+ * topic failed to decode, and where.
  */
-function topicsFromEvent(event: unknown): string[] | null {
+function inspectTopics(event: unknown): TopicInspection {
   const wrapper = event as {
     event?: { body?: unknown };
     body?: { v0?: { topics?: unknown[] }; value?: { v0?: { topics?: unknown[] } } };
@@ -179,15 +189,59 @@ function topicsFromEvent(event: unknown): string[] | null {
     | { v0?: { topics?: unknown[] }; value?: { v0?: { topics?: unknown[] } } }
     | undefined;
   const topics = body?.v0?.topics ?? body?.value?.v0?.topics;
-  if (!Array.isArray(topics)) return null;
+  if (!Array.isArray(topics)) {
+    return {
+      ok: false,
+      stage: "topics",
+      topicIndex: null,
+      message: "event carries no contract-event topic list",
+    };
+  }
 
   const out: string[] = [];
-  for (const topic of topics) {
+  for (const [index, topic] of topics.entries()) {
     const symbol = topicToSymbol(topic);
-    if (symbol === null) return null;
+    if (symbol === null) {
+      return {
+        ok: false,
+        stage: "topic",
+        topicIndex: index,
+        message: `topic[${index}] is not a decodable ScVal`,
+      };
+    }
     out.push(symbol);
   }
-  return out;
+  return { ok: true, topics: out };
+}
+
+/**
+ * Pull the topic list out of a decoded `xdr.ContractEvent` or
+ * `xdr.DiagnosticEvent`.
+ *
+ * A `DiagnosticEvent` wraps the contract event in its `event` field; a
+ * `ContractEvent` carries `body.v0.topics` directly.
+ */
+function topicsFromEvent(event: unknown): string[] | null {
+  const inspected = inspectTopics(event);
+  return inspected.ok ? inspected.topics : null;
+}
+
+/** Parse either XDR wrapper the public decoders accept. */
+function parseEventXdr(
+  xdrBase64: string,
+): { ok: true; event: unknown } | { ok: false; message: string } {
+  try {
+    return { ok: true, event: xdr.DiagnosticEvent.fromXDR(xdrBase64, "base64") };
+  } catch {
+    try {
+      return { ok: true, event: xdr.ContractEvent.fromXDR(xdrBase64, "base64") };
+    } catch {
+      return {
+        ok: false,
+        message: "input is neither a base64 DiagnosticEvent nor a ContractEvent",
+      };
+    }
+  }
 }
 
 /**
@@ -229,4 +283,199 @@ export function decodeGuardEventXdr(
   const topics = topicsFromEvent(event);
   if (!topics) return null;
   return decodeAuthDecision(topics, source);
+}
+
+/** Pipeline stage at which strict offline validation rejected an input. */
+export type GuardEventValidationStage = "input" | "xdr" | "topics" | "topic" | "decision";
+
+/** Stable, machine-readable reason a strict validation input was rejected. */
+export type GuardEventValidationCode =
+  | "input.not_string"
+  | "input.empty"
+  | "xdr.unparseable"
+  | "topics.missing"
+  | "topic.undecodable"
+  | "decision.unknown_topic"
+  | "decision.invalid_result";
+
+/** Options for `validateGuardEventXdr()`. */
+export interface GuardEventValidationOptions {
+  /** Source recorded on each successfully decoded decision. Defaults to `diagnostic`. */
+  source?: GuardAuthDecision["source"];
+  /** Base path used in failure messages. Defaults to `events`. */
+  path?: string;
+}
+
+/** One input that strict offline validation accepted. */
+export interface GuardEventValidationSuccess {
+  index: number;
+  path: string;
+  decision: GuardAuthDecision;
+}
+
+/** One input that strict offline validation rejected. */
+export interface GuardEventValidationFailure {
+  /** Position of the input in the validated array. */
+  index: number;
+  /**
+   * Stable dotted path to the failing field, e.g. `events[2]` for an XDR parse
+   * failure or `events[2].topics[0]` for an unknown name topic.
+   */
+  path: string;
+  /** Stage of the decode pipeline that rejected the input. */
+  stage: GuardEventValidationStage;
+  /** Stable code for this failure mode; safe to branch on. */
+  code: GuardEventValidationCode;
+  /** Human-readable detail for logs and fixture diffs. */
+  message: string;
+}
+
+/** The per-input outcome, in the same order as the validated inputs. */
+export type GuardEventValidationEntry =
+  | (GuardEventValidationSuccess & { ok: true })
+  | (GuardEventValidationFailure & { ok: false });
+
+/** The result of strict offline validation over a batch of XDR inputs. */
+export interface GuardEventValidationReport {
+  /** True only when every input decoded to a guard decision. */
+  ok: boolean;
+  /** One entry per input, in input order. */
+  results: GuardEventValidationEntry[];
+  /** Successfully decoded decisions, in input order. */
+  events: GuardAuthDecision[];
+  /** Every rejection, in input order. */
+  failures: GuardEventValidationFailure[];
+}
+
+type StrictDecodeOutcome =
+  | { ok: true; decision: GuardAuthDecision }
+  | {
+      ok: false;
+      stage: GuardEventValidationStage;
+      code: GuardEventValidationCode;
+      message: string;
+      topicIndex?: number;
+    };
+
+/**
+ * Strictly decode one XDR input, reporting the precise failure stage instead of
+ * returning `null`.
+ */
+function strictDecodeGuardEventXdr(
+  input: unknown,
+  source: GuardAuthDecision["source"],
+): StrictDecodeOutcome {
+  if (typeof input !== "string") {
+    return {
+      ok: false,
+      stage: "input",
+      code: "input.not_string",
+      message: `input must be a base64 XDR string, received ${typeof input}`,
+    };
+  }
+  if (input.length === 0) {
+    return {
+      ok: false,
+      stage: "input",
+      code: "input.empty",
+      message: "input is an empty string",
+    };
+  }
+
+  const parsed = parseEventXdr(input);
+  if (!parsed.ok) {
+    return { ok: false, stage: "xdr", code: "xdr.unparseable", message: parsed.message };
+  }
+
+  const topics = inspectTopics(parsed.event);
+  if (!topics.ok) {
+    return {
+      ok: false,
+      stage: topics.stage,
+      code: topics.stage === "topics" ? "topics.missing" : "topic.undecodable",
+      message: topics.message,
+      ...(topics.topicIndex !== null ? { topicIndex: topics.topicIndex } : {}),
+    };
+  }
+
+  const decision = decodeAuthDecision(topics.topics, source);
+  if (decision === null) {
+    if (topics.topics[0] !== GUARD_EVENT_TOPICS.authChecked) {
+      return {
+        ok: false,
+        stage: "decision",
+        code: "decision.unknown_topic",
+        message: `name topic ${JSON.stringify(topics.topics[0] ?? "")} is not ${GUARD_EVENT_TOPICS.authChecked}`,
+        topicIndex: 0,
+      };
+    }
+    return {
+      ok: false,
+      stage: "decision",
+      code: "decision.invalid_result",
+      message: `decision result ${JSON.stringify(topics.topics[1] ?? "")} is neither allowed nor blocked`,
+      topicIndex: 1,
+    };
+  }
+  return { ok: true, decision };
+}
+
+/**
+ * Strict, offline validation for captured event XDR fixtures.
+ *
+ * This is deliberately separate from `decodeGuardEventXdr()`. The live decode
+ * entry points stay resilient — they return `null` or drop an unrecognised
+ * event so a long-running monitor cannot be killed by one bad payload. A
+ * fixture maintainer needs the opposite guarantee: every input is accounted
+ * for, and a failure says exactly which input failed and at which stage.
+ *
+ * The report preserves input order. Successful decisions land in `events`;
+ * every rejection lands in `failures` with a stable `index`, `stage`, `code`,
+ * and `path`. See `docs/api/telemetry-listener.md` for the stage vocabulary.
+ *
+ * ```ts
+ * const report = validateGuardEventXdr(fixtureXdr, { source: "ledger" });
+ * if (!report.ok) {
+ *   for (const failure of report.failures) {
+ *     recordFailure(failure.path, failure.stage, failure.code, failure.message);
+ *   }
+ * }
+ * ```
+ */
+export function validateGuardEventXdr(
+  inputs: readonly unknown[],
+  options: GuardEventValidationOptions = {},
+): GuardEventValidationReport {
+  const source = options.source ?? "diagnostic";
+  const basePath = options.path ?? "events";
+  const results: GuardEventValidationEntry[] = [];
+  const events: GuardAuthDecision[] = [];
+  const failures: GuardEventValidationFailure[] = [];
+
+  for (const [index, input] of inputs.entries()) {
+    const path = `${basePath}[${index}]`;
+    const outcome = strictDecodeGuardEventXdr(input, source);
+    if (outcome.ok) {
+      results.push({ ok: true, index, path, decision: outcome.decision });
+      events.push(outcome.decision);
+      continue;
+    }
+
+    const failure: GuardEventValidationFailure = {
+      index,
+      path:
+        outcome.topicIndex !== undefined
+          ? `${path}.topics[${outcome.topicIndex}]`
+          : outcome.stage === "topics"
+            ? `${path}.topics`
+            : path,
+      stage: outcome.stage,
+      code: outcome.code,
+      message: outcome.message,
+    };
+    results.push({ ok: false, ...failure });
+    failures.push(failure);
+  }
+
+  return { ok: failures.length === 0, results, events, failures };
 }

@@ -798,3 +798,75 @@ claim one. The five scenarios recorded above are produced by the guard contract
 during enforced simulation; no line this PR touches participates in that, so the
 recorded results remain valid for them.
 
+## Addendum — 2026-10-19 (PR: issues #340, #341, #343, #344 — heartbeat retry and validation, richer policy summary, detached telemetry snapshots)
+
+Recorded because this PR reaches the enforcement-path file list through
+`src/policy.ts` (issue #343, `describePolicy`) and CI's `enforcement-path
+evidence gate` therefore requires this file in the diff.
+
+**It is not accompanied by a fresh live-testnet run**: `.env.phase2` is absent
+from this contributor checkout, so `npm run test:integration` cannot begin its
+scenarios. No fresh Phase-2 transcript is claimed below. The CI gate verifies
+only that this file was touched — not the numbers — and the same limitation
+stated in every addendum above applies here unchanged.
+
+### What the PR changes on the enforcement path
+
+Exactly one function in `src/policy.ts`, and it is a rendering helper, not a
+decision:
+
+- `src/policy.ts`: `describePolicy()` — the operator-facing, log-friendly
+  summary of a policy — now also reports the constraints it previously omitted:
+  the blocked recipients (`blocked_recipients`), the per-recipient window caps
+  (`recipient_window_caps`), and the active window (`active_from` /
+  `active_until`) with its state at a given moment. Recipient lists are
+  reported as counts unless the new `detail: true` option asks for the
+  addresses, the lists are sorted so the output is stable, and the new
+  `nowSecs` option pins the moment the window is judged against. A new
+  `DescribePolicyOptions` type and an `ActiveWindowState` type are exported
+  alongside it.
+
+Unchanged, deliberately: `policyToScVal`, `decodePolicy`, `policyFromScVal`,
+`validateGuardPolicy`, `POLICY_RULE_IDS`, the address type guards, the
+`ReadonlyPolicyConfig` / `freezePolicy` boundary, the dead-man helpers
+(`isDeadManFrozen`, `deadManRemaining`), `extractTransferAmount`,
+`readPersistentEntry` and `fetchGuardPolicyAndWindow`. None of them reads or
+writes the summary, and the summary reads only fields the policy already
+carried — it produces a string for a human and is never consulted by the
+authorization path, the policy encoding, the pre-flight simulation or the
+block classification. The five scenarios recorded above are produced by the
+guard contract during enforced simulation; no line this PR touches participates
+in that, so the recorded results remain valid for them.
+
+The rest of the PR is outside the enforcement path entirely: the bounded
+heartbeat retry and its input validation (`src/heartbeat.ts`) and the detached
+telemetry snapshots (`src/telemetry.ts`) are operator-side plumbing that cannot
+reach a verdict.
+
+### What did run locally (Node v24.21.0, matching the package's engine)
+
+```text
+npm run typecheck                        # clean
+npm run check:strict-ratchet             # ok
+npm run lint                             # clean
+npm run build                            # clean
+node --import tsx scripts/check-doc-links.ts   # 36 files, 193 links, no broken links or anchors
+npm scripts/check-bundle-size.mjs        # within budget (raw 888,474 B / gzip 202,167 B)
+```
+
+The unit suite covers the new behaviour with no network and no credentials:
+`tests/unit/policy.test.ts` pins the summary's contents (counts by default, the
+address lists on request, the sorted/stable output, and the four active-window
+states including the `nowSecs` boundary cases), `tests/unit/heartbeat.test.ts`
+pins the retry budget, the deterministic backoff, the abort, the exhaustion
+path and the "a policy block is never retried" rule as well as every rejected
+scheduler input, and `tests/unit/telemetry.test.ts` pins the detached snapshot
+contract at the top level, in the nested decoded data and in the opt-in raw
+payload.
+
+**A maintainer with `.env.phase2` should run `npm run test:integration` against
+this branch before merge** and replace this addendum with the fresh run output.
+No credentials, deployment or policy change are needed beyond what the suite
+already does.
+
+

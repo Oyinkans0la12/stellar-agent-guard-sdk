@@ -8,11 +8,16 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { Keypair } from "@stellar/stellar-sdk";
 import {
+  HeartbeatBlockedError,
   HeartbeatIntervalError,
+  isRetryableHeartbeatFailure,
   startHeartbeat,
   type HeartbeatBeat,
   type HeartbeatOptions,
 } from "../../src/heartbeat.ts";
+import { BroadcastError, SimulationError } from "../../src/errors.ts";
+import { RpcTimeoutError, type InvokeOutcome } from "../../src/invoke.ts";
+import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 
 const GUARD = "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44";
@@ -367,5 +372,368 @@ describe("startHeartbeat grace validation", () => {
       baseOptions({ intervalMs: 20_000, readPolicy: async () => policy }),
     );
     await handle.stop();
+  });
+});
+
+/**
+ * Bounded retry and backoff for transient submission failures (issue #340).
+ *
+ * A heartbeat that fails on a transport error used to wait for the next fixed
+ * interval before trying again, which could freeze an account whose grace
+ * window closed in between. The retry is bounded, jittered, and never applied
+ * to a policy block.
+ */
+describe("startHeartbeat bounded retry (issue #340)", () => {
+  /**
+   * The fake clock plus a record of every delay it was asked for, so the
+   * backoff can be asserted exactly.
+   */
+  function recordingClock() {
+    const clock = fakeClock();
+    const delays: number[] = [];
+    const wait = (ms: number, signal?: AbortSignal): Promise<void> => {
+      delays.push(ms);
+      return clock.wait(ms, signal);
+    };
+    return { clock, delays, wait, now: clock.now };
+  }
+
+  it("makes one attempt per beat when no retry policy is configured", async () => {
+    const clock = fakeClock();
+    let attempts = 0;
+    const errors: unknown[] = [];
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        graceSecs: 30,
+        submit: async () => {
+          attempts += 1;
+          throw new BroadcastError("rpc down");
+        },
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick();
+    assert.equal(attempts, 1, "retries are opt-in: one attempt per beat by default");
+    assert.equal(errors.length, 1);
+    assert.ok(errors[0] instanceof BroadcastError, "the original error is reported as-is");
+
+    await handle.stop();
+  });
+
+  it("retries a transport failure and reports how many attempts the beat took", async () => {
+    const { clock, delays, wait, now } = recordingClock();
+    const beats: HeartbeatBeat[] = [];
+    const warnings: string[] = [];
+    const errors: unknown[] = [];
+    let attempts = 0;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now,
+        wait,
+        graceSecs: 30,
+        retry: { maxAttempts: 3, baseDelayMs: 100, maxDelayMs: 1_000, random: () => 0.5 },
+        submit: async () => {
+          attempts += 1;
+          if (attempts === 1) throw new BroadcastError("rpc down");
+          return {};
+        },
+        onBeat: (beat) => beats.push(beat),
+        onWarning: (message) => warnings.push(message),
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick();
+    assert.equal(attempts, 1);
+    assert.equal(errors.length, 0, "a failure that will be retried is not the final failure");
+    assert.equal(warnings.length, 1, "the attempt and its delay are announced");
+    assert.match(warnings[0]!, /attempt 1 of 3/);
+    assert.match(warnings[0]!, /retrying in 50ms/);
+    assert.deepEqual(
+      delays,
+      [0, 50],
+      "the backoff is the full-jitter sample of the base window",
+    );
+
+    await clock.tick();
+    assert.equal(attempts, 2);
+    assert.equal(beats.length, 1);
+    assert.equal(beats[0]!.attempt, 2, "the beat reports how many attempts it took");
+    assert.equal(errors.length, 0, "a recovered beat is not an error");
+
+    await handle.stop();
+  });
+
+  it("exhausts the budget and reports the final failure exactly once", async () => {
+    const { clock, wait, now } = recordingClock();
+    const errors: unknown[] = [];
+    const warnings: string[] = [];
+    let attempts = 0;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now,
+        wait,
+        graceSecs: 30,
+        retry: { maxAttempts: 3, baseDelayMs: 10, random: () => 0 },
+        submit: async () => {
+          attempts += 1;
+          throw new BroadcastError("rpc down");
+        },
+        onError: (error) => errors.push(error),
+        onWarning: (message) => warnings.push(message),
+      }),
+    );
+
+    await clock.tick();
+    await clock.tick();
+    await clock.tick();
+
+    assert.equal(attempts, 3, "the budget bounds the attempts per beat");
+    assert.equal(errors.length, 1, "the final failure is reported once");
+    assert.ok(errors[0] instanceof BroadcastError);
+    assert.equal(
+      warnings.length,
+      2,
+      "only the attempts that are followed by a retry are announced",
+    );
+
+    await handle.stop();
+  });
+
+  it("never retries a policy block", async () => {
+    const clock = fakeClock();
+    const errors: unknown[] = [];
+    let attempts = 0;
+    const blocked: InvokeOutcome = {
+      kind: "blocked",
+      reason: "paused",
+      detail: "the policy is paused",
+      diagnosticEvents: [],
+    };
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        graceSecs: 30,
+        retry: { maxAttempts: 3, baseDelayMs: 10, random: () => 0 },
+        submit: async () => {
+          attempts += 1;
+          return { outcome: blocked };
+        },
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick();
+    assert.equal(attempts, 1, "a refusal is a decision, not a transport failure");
+    assert.equal(errors.length, 1);
+    assert.ok(errors[0] instanceof HeartbeatBlockedError);
+    assert.equal((errors[0] as HeartbeatBlockedError).reason, "paused");
+
+    await handle.stop();
+  });
+
+  it("does not retry a failure the SDK cannot classify", async () => {
+    const clock = fakeClock();
+    const errors: unknown[] = [];
+    let attempts = 0;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        graceSecs: 30,
+        retry: { maxAttempts: 3, baseDelayMs: 10, random: () => 0 },
+        submit: async () => {
+          attempts += 1;
+          throw new Error("boom");
+        },
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick();
+    assert.equal(attempts, 1, "an unknown error is reported, not retried");
+    assert.equal(errors.length, 1);
+    assert.equal((errors[0] as Error).message, "boom");
+
+    await handle.stop();
+  });
+
+  it("stops during the backoff without another attempt and without an error", async () => {
+    const { clock, wait, now } = recordingClock();
+    const errors: unknown[] = [];
+    let attempts = 0;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now,
+        wait,
+        graceSecs: 30,
+        retry: { maxAttempts: 3, baseDelayMs: 100, random: () => 0.5 },
+        submit: async () => {
+          attempts += 1;
+          throw new BroadcastError("rpc down");
+        },
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick();
+    assert.equal(attempts, 1);
+
+    await handle.stop();
+
+    assert.equal(attempts, 1, "a stopped scheduler makes no further attempt");
+    assert.equal(errors.length, 0, "a stop is teardown, not a failure");
+  });
+
+  it("classifies retryable and non-retryable failures", () => {
+    assert.equal(isRetryableHeartbeatFailure(new BroadcastError("rpc down")), true);
+    assert.equal(
+      isRetryableHeartbeatFailure(new RpcTimeoutError({ stage: "invoke", aborted: false })),
+      true,
+    );
+    assert.equal(
+      isRetryableHeartbeatFailure(
+        new SimulationError("probe failed", { stage: "probe", cause: new Error("offline") }),
+      ),
+      true,
+    );
+    // A policy refusal is a decision, never a transport failure.
+    assert.equal(
+      isRetryableHeartbeatFailure(
+        new GuardBlockedError({ reason: "paused", stage: "submission" }),
+      ),
+      false,
+    );
+    assert.equal(
+      isRetryableHeartbeatFailure(new HeartbeatBlockedError({ reason: "paused" })),
+      false,
+    );
+    // Anything unclassifiable is reported, not retried.
+    assert.equal(isRetryableHeartbeatFailure(new Error("boom")), false);
+    assert.equal(isRetryableHeartbeatFailure("boom"), false);
+  });
+});
+
+/**
+ * Input validation (issue #341).
+ *
+ * The scheduler's inputs decide whether a beat is late or the agent is
+ * misconfigured. A negative skew threshold, an unusable grace window, or a
+ * callback that is not callable must fail before the first beat — and before
+ * the grace window is even read from the chain.
+ */
+describe("startHeartbeat input validation (issue #341)", () => {
+  it("rejects a non-finite maxSkewMs", async () => {
+    for (const maxSkewMs of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      await assert.rejects(
+        startHeartbeat(baseOptions({ maxSkewMs })),
+        (error: unknown) =>
+          error instanceof RangeError && /maxSkewMs/.test((error as Error).message),
+      );
+    }
+  });
+
+  it("rejects a negative maxSkewMs", async () => {
+    await assert.rejects(
+      startHeartbeat(baseOptions({ maxSkewMs: -1 })),
+      (error: unknown) =>
+        error instanceof RangeError && /maxSkewMs/.test((error as Error).message),
+    );
+  });
+
+  it("accepts a zero and a positive maxSkewMs", async () => {
+    const strict = await startHeartbeat(baseOptions({ maxSkewMs: 0 }));
+    await strict.stop();
+    const tolerant = await startHeartbeat(baseOptions({ maxSkewMs: 2_000 }));
+    await tolerant.stop();
+  });
+
+  it("rejects a grace window that cannot survive the conversion", async () => {
+    for (const graceSecs of [
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      -1,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 2,
+    ]) {
+      await assert.rejects(
+        startHeartbeat(baseOptions({ graceSecs })),
+        (error: unknown) =>
+          error instanceof RangeError && /graceSecs/.test((error as Error).message),
+      );
+    }
+  });
+
+  it("rejects a negative bigint grace window", async () => {
+    await assert.rejects(
+      startHeartbeat(baseOptions({ graceSecs: -1n })),
+      (error: unknown) =>
+        error instanceof RangeError && /graceSecs/.test((error as Error).message),
+    );
+  });
+
+  it("accepts the grace values that survive the conversion", async () => {
+    for (const graceSecs of [0, 30, 30n, Number.MAX_SAFE_INTEGER]) {
+      const handle = await startHeartbeat(baseOptions({ graceSecs, intervalMs: 1_000 }));
+      await handle.stop();
+    }
+  });
+
+  it("rejects a scheduler callback that is not callable", async () => {
+    await assert.rejects(
+      startHeartbeat(baseOptions({ onBeat: "not-a-function" as never })),
+      TypeError,
+    );
+    await assert.rejects(startHeartbeat(baseOptions({ wait: 42 as never })), TypeError);
+    await assert.rejects(startHeartbeat(baseOptions({ now: 42 as never })), TypeError);
+  });
+
+  it("rejects an unusable retry budget", async () => {
+    await assert.rejects(startHeartbeat(baseOptions({ retry: { maxAttempts: 0 } })), RangeError);
+    await assert.rejects(
+      startHeartbeat(baseOptions({ retry: { maxAttempts: 1.5 } })),
+      RangeError,
+    );
+    await assert.rejects(
+      startHeartbeat(baseOptions({ retry: { baseDelayMs: -1 } })),
+      RangeError,
+    );
+    await assert.rejects(
+      startHeartbeat(baseOptions({ retry: { maxDelayMs: Number.NaN } })),
+      RangeError,
+    );
+  });
+
+  it("rejects before anything is scheduled, submitted or read from the chain", async () => {
+    let submissions = 0;
+    let policyReads = 0;
+    await assert.rejects(
+      startHeartbeat(
+        baseOptions({
+          maxSkewMs: -1,
+          submit: async () => {
+            submissions += 1;
+            return {};
+          },
+          readPolicy: async () => {
+            policyReads += 1;
+            return null;
+          },
+        }),
+      ),
+      RangeError,
+    );
+    assert.equal(submissions, 0, "no beat may be submitted");
+    assert.equal(policyReads, 0, "and the grace window must not even be read");
   });
 });

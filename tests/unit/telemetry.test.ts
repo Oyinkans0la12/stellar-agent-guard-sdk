@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { xdr } from "@stellar/stellar-sdk";
+import { StrKey, xdr } from "@stellar/stellar-sdk";
 import {
   DEFAULT_JITTER_FRACTION,
   GuardEventRingBuffer,
@@ -1143,6 +1143,137 @@ describe("GuardEventRingBuffer (issue #68)", () => {
   });
 });
 
+/**
+ * Detached snapshots from `recent()` (issue #344).
+ *
+ * `recent()` used to hand out the buffer's own event objects: a consumer that
+ * edited one changed what the buffer still retained, and the next `recent()`
+ * reported the edit instead of the event. The contract is now a *detached
+ * snapshot* — the array, the events in it, and everything nested inside them
+ * (decoded data, the decoded decision, the opt-in raw payload) are copies.
+ */
+describe("GuardEventRingBuffer detached snapshots (issue #344)", () => {
+  /** A minimal well-formed event; only the fields a test cares about are overridden. */
+  function event(partial: Partial<GuardEvent>): GuardEvent {
+    return {
+      id: "id",
+      kind: "auth_checked",
+      topic: "event_auth_checked",
+      source: "ledger",
+      stream: "committed",
+      contractId: GUARD,
+      ledger: 100,
+      ledgerClosedAt: null,
+      observedAt: null,
+      transactionHash: null,
+      decision: null,
+      data: null,
+      ...partial,
+    };
+  }
+
+  it("hands out a fresh event object on every call", () => {
+    const buffer = new GuardEventRingBuffer(2);
+    buffer.push(event({ id: "a" }));
+
+    const first = buffer.recent();
+    const second = buffer.recent();
+
+    assert.notEqual(first[0], second[0], "each snapshot is a new object");
+    assert.equal(first[0]!.id, "a", "and it still carries the retained event's data");
+  });
+
+  it("a top-level edit cannot change the retained event", () => {
+    const buffer = new GuardEventRingBuffer(2);
+    buffer.push(event({ id: "a", ledger: 100 }));
+
+    const snapshot = buffer.recent();
+    snapshot[0]!.id = "mutated";
+    snapshot[0]!.ledger = 999;
+
+    const retained = buffer.recent()[0]!;
+    assert.equal(retained.id, "a");
+    assert.equal(retained.ledger, 100);
+  });
+
+  it("a nested edit cannot change the retained decoded data", () => {
+    const buffer = new GuardEventRingBuffer(2);
+    buffer.push(event({ id: "a", data: { nested: { amount: 10n }, list: [1, 2] } }));
+
+    const snapshot = buffer.recent();
+    const edited = snapshot[0]!.data as { nested: { amount: bigint }; list: number[] };
+    edited.nested.amount = 99n;
+    edited.list.push(3);
+
+    const retained = buffer.recent()[0]!.data as { nested: { amount: bigint }; list: number[] };
+    assert.equal(retained.nested.amount, 10n, "the retained nested value is untouched");
+    assert.deepEqual(retained.list, [1, 2], "and so is the retained list");
+  });
+
+  it("a nested edit cannot change the retained decision", () => {
+    const buffer = new GuardEventRingBuffer(2);
+    buffer.push(
+      event({
+        id: "a",
+        source: "diagnostic",
+        stream: "diagnostic",
+        decision: { result: "blocked", reason: "paused", source: "diagnostic" },
+      }),
+    );
+
+    const snapshot = buffer.recent();
+    (snapshot[0]!.decision as { reason: string }).reason = "mutated";
+
+    assert.equal(buffer.recent()[0]!.decision?.reason, "paused");
+  });
+
+  it("a nested edit cannot change the retained raw payload", () => {
+    const buffer = new GuardEventRingBuffer(2);
+    const raw = { event: { contractId: GUARD, body: { v0: { topics: [] } } } };
+    buffer.push(event({ id: "a", raw }));
+
+    const snapshot = buffer.recent();
+    assert.notEqual(snapshot[0]!.raw, raw, "the raw payload is copied, not aliased");
+    (snapshot[0]!.raw as { event: { contractId: string } }).event.contractId = "mutated";
+
+    const retained = buffer.recent()[0]!.raw as { event: { contractId: string } };
+    assert.equal(retained.event.contractId, GUARD);
+  });
+
+  it("keeps the raw payload's shape: an XDR value in the copy is still an XDR value", () => {
+    const buffer = new GuardEventRingBuffer(1);
+    const raw = { topic: [xdr.ScVal.scvSymbol("event_auth_checked")] };
+    buffer.push(event({ id: "a", raw }));
+
+    const copied = buffer.recent()[0]!.raw as { topic: xdr.ScVal[] };
+    assert.ok(copied.topic[0] instanceof xdr.ScVal, "the copy keeps the XDR prototype");
+    assert.equal(copied.topic[0]!.type, "scvSymbol");
+  });
+
+  it("leaves `raw` absent when the decode did not retain it", () => {
+    const buffer = new GuardEventRingBuffer(1);
+    buffer.push(event({ id: "a" }));
+
+    const snapshot = buffer.recent()[0]!;
+    assert.equal(snapshot.raw, undefined);
+    assert.ok(!("raw" in snapshot), "an absent raw payload stays absent in the snapshot");
+  });
+
+  it("detaches byte arrays, so a byte written into the copy stays there", () => {
+    const buffer = new GuardEventRingBuffer(1);
+    const bytes = new Uint8Array([1, 2, 3]);
+    buffer.push(event({ id: "a", data: { bytes } }));
+
+    const snapshot = buffer.recent();
+    const edited = snapshot[0]!.data as { bytes: Uint8Array };
+    edited.bytes[0] = 99;
+
+    const retained = buffer.recent()[0]!.data as { bytes: Uint8Array };
+    assert.equal(retained.bytes[0], 1, "the retained bytes are untouched");
+    assert.notEqual(retained.bytes, bytes, "and the byte array itself is a copy");
+  });
+});
+
 describe("GuardTelemetryListener opt-in buffer (issue #68)", () => {
   function rawLedgerEvent(ledger: number) {
     return {
@@ -1241,6 +1372,25 @@ describe("GuardTelemetryListener opt-in buffer (issue #68)", () => {
       filtered.map((event) => event.ledger),
       [20],
     );
+  });
+
+  it("hands out detached snapshots, so a consumer's edit never reaches the buffer", async () => {
+    const server = singlePageServer([rawLedgerEvent(500)]);
+    const listener = new GuardTelemetryListener({
+      server: server as never,
+      guard: GUARD,
+      buffer: { max: 5 },
+    });
+
+    await listener.poll({ startLedger: 500 });
+
+    const snapshot = listener.recent();
+    snapshot[0]!.ledger = 999;
+    snapshot[0]!.id = "mutated";
+
+    const retained = listener.recent()[0]!;
+    assert.equal(retained.ledger, 500, "the listener still retains the decoded event");
+    assert.notEqual(retained.id, "mutated");
   });
 });
 
@@ -1423,5 +1573,162 @@ describe("GuardTelemetryListener counters", () => {
     assert.ok(stats);
     assert.equal(stats!.allowed, 2);
     assert.equal(stats!.blocked, 0);
+  });
+});
+
+/**
+ * Wall-clock rollback (#320).
+ *
+ * The counters evict on a monotonic timeline: observations are clamped to the
+ * high-water mark, so a clock that moves backwards cannot extend how long an
+ * entry is retained, and a clock that jumps forward still expires stale entries
+ * immediately. Only an injected clock is used, so there is no wall-clock wait.
+ */
+describe("GuardDecisionCounters wall-clock resilience (issue #320)", () => {
+  const decisionEvent = (
+    result: "allowed" | "blocked",
+    reason: string | null,
+    index: number,
+  ): GuardEvent => ({
+    id: `diag:${index.toString(16).padStart(64, "0")}`,
+    kind: "auth_checked",
+    topic: "event_auth_checked",
+    source: "diagnostic",
+    stream: "diagnostic",
+    contractId: GUARD,
+    ledger: null,
+    ledgerClosedAt: null,
+    observedAt: new Date(index).toISOString(),
+    transactionHash: null,
+    decision: { result, reason, source: "diagnostic" } as GuardEvent["decision"],
+    data: {},
+  });
+
+  it("does not retain entries past the window when the clock rolls back", () => {
+    let now = 1_000;
+    const listener = new GuardTelemetryListener({
+      counters: { windowMs: 1_000 },
+      clock: () => now,
+    });
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 0));
+
+    // A rollback must not move the eviction cutoff backwards. The entry stays
+    // retained only for the original window, measured on internal time.
+    now = 0;
+    listener.observe(decisionEvent("allowed", null, 1));
+    let stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.allowed + stats!.blocked, 2, "a rollback does not evict early");
+    assert.equal(stats!.windowStart, 1_000, "clamped to the high-water mark, not the rolled-back value");
+
+    // Still inside the window on the monotonic timeline (cutoff 999).
+    now = 1_999;
+    stats = listener.stats();
+    assert.equal(stats!.allowed + stats!.blocked, 2);
+
+    // One millisecond past the window: both entries at t=1000 age out.
+    now = 2_001;
+    stats = listener.stats();
+    assert.equal(stats!.allowed, 0);
+    assert.equal(stats!.blocked, 0);
+    assert.deepEqual(stats!.byReason, {});
+    assert.equal(stats!.windowStart, 2_001, "an empty window starts at the current monotonic time");
+  });
+
+  it("honours a forward jump immediately", () => {
+    let now = 1_000;
+    const listener = new GuardTelemetryListener({
+      counters: { windowMs: 1_000 },
+      clock: () => now,
+    });
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 0));
+    now = 5_000;
+    const stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.blocked, 0);
+    assert.deepEqual(stats!.byReason, {});
+  });
+});
+
+/**
+ * Emitting-identity validation before decoding (#322).
+ *
+ * `poll()` filters by contract server-side, but does not trust that filter. An
+ * RPC that returns another contract's guard-shaped topic must not have it
+ * reported as this guard's decision; missing or malformed identity fails closed
+ * and every rejection is counted in `PollResult.dropped`.
+ */
+describe("GuardTelemetryListener event identity validation (issue #322)", () => {
+  const FOREIGN = StrKey.encodeContract(new Uint8Array(32).fill(7));
+
+  function eventFor(contractId: unknown, topics: string[]) {
+    return {
+      ...(contractId === undefined ? {} : { contractId }),
+      type: "contract",
+      ledger: 500,
+      ledgerClosedAt: "2026-09-27T00:00:00Z",
+      txHash: "ab".repeat(32),
+      topic: topics.map((topic) => xdr.ScVal.scvSymbol(topic)),
+      value: xdr.ScVal.scvMap([]),
+    };
+  }
+
+  function serverFor(events: unknown[]) {
+    return {
+      getLatestLedger: async () => ({ sequence: 600 }),
+      getEvents: async () => ({ events, cursor: "cursor_1", latestLedger: 600 }),
+    };
+  }
+
+  it("drops a foreign contract's guard-shaped topic instead of reporting a decision", async () => {
+    const foreign = eventFor(FOREIGN, ["event_auth_checked", "allowed", ""]);
+    const own = eventFor(GUARD, ["event_auth_checked", "blocked", "per_tx_cap_exceeded"]);
+    const listener = new GuardTelemetryListener({
+      server: serverFor([foreign, own]) as never,
+      guard: GUARD,
+    });
+
+    const page = await listener.poll({ startLedger: 100 });
+    assert.equal(page.events.length, 1);
+    assert.equal(page.events[0]!.contractId, GUARD);
+    assert.equal(page.events[0]!.decision?.reason, "per_tx_cap_exceeded");
+    assert.deepEqual(page.dropped, {
+      unknownTopic: 0,
+      foreignContract: 1,
+      missingContractId: 0,
+      malformedContractId: 0,
+    });
+  });
+
+  it("fails closed on missing and malformed identity, and counts each reason", async () => {
+    const listener = new GuardTelemetryListener({
+      server: serverFor([
+        eventFor(undefined, ["event_auth_checked", "allowed", ""]),
+        eventFor("not-a-contract", ["event_auth_checked", "allowed", ""]),
+        eventFor(GUARD, ["event_auth_checked", "allowed", ""]),
+        eventFor(GUARD, ["event_not_in_this_version"]),
+      ]) as never,
+      guard: GUARD,
+    });
+
+    const page = await listener.poll({ startLedger: 100 });
+    assert.equal(page.events.length, 1, "only the verifiable, known-topic event decodes");
+    assert.deepEqual(page.dropped, {
+      unknownTopic: 1,
+      foreignContract: 0,
+      missingContractId: 1,
+      malformedContractId: 1,
+    });
+  });
+
+  it("accepts identity reported with surrounding whitespace by canonicalising it", async () => {
+    const padded = ` ${GUARD} `;
+    const listener = new GuardTelemetryListener({
+      server: serverFor([eventFor(padded, ["event_auth_checked", "allowed", ""])]) as never,
+      guard: GUARD,
+    });
+    const page = await listener.poll({ startLedger: 100 });
+    assert.equal(page.events.length, 1);
+    assert.equal(page.events[0]!.contractId, GUARD);
   });
 });

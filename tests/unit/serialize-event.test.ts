@@ -9,8 +9,15 @@
  * documented in `docs/event-schema.md` under "Canonical JSON serialization".
  */
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
-import { serializeEvent, type GuardEvent } from "../../src/telemetry.ts";
+import {
+  parseEventRecord,
+  serializeEvent,
+  serializeEventRecord,
+  TELEMETRY_EVENT_RECORD_VERSION,
+  type GuardEvent,
+} from "../../src/telemetry.ts";
 
 const GUARD = "CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44";
 const TX = "ab".repeat(32);
@@ -262,5 +269,65 @@ describe("serializeEvent contract", () => {
   it("never throws on a bigint payload (JSON.stringify would)", () => {
     assert.throws(() => JSON.stringify({ at: 1789393232n }));
     assert.doesNotThrow(() => serializeEvent(FIXTURES[2]!));
+  });
+});
+
+/**
+ * Versioned serialized records (#323).
+ *
+ * The bare `serializeEvent()` output is a documented Stable format and stays
+ * byte-identical. Persisted records opt into `serializeEventRecord()`, whose
+ * envelope carries `v` explicitly; a legacy line is identifiable by the absence
+ * of `v` (version 0). The committed golden fixture makes a schema bump a
+ * deliberate diff rather than an unremarked one.
+ */
+describe("versioned event records (issue #323)", () => {
+  const GOLDEN_PATH = new URL(
+    "../fixtures/telemetry/event-record-v1.golden.json",
+    import.meta.url,
+  );
+
+  it("matches the committed golden fixture", () => {
+    const golden = readFileSync(GOLDEN_PATH, "utf8").trimEnd();
+    assert.equal(serializeEventRecord(FIXTURES[0]!), golden);
+  });
+
+  it("wraps the unchanged bare projection without altering the stable format", () => {
+    const record = JSON.parse(serializeEventRecord(FIXTURES[0]!)) as {
+      v: number;
+      event: Record<string, unknown>;
+    };
+    assert.equal(record.v, TELEMETRY_EVENT_RECORD_VERSION);
+    assert.equal(TELEMETRY_EVENT_RECORD_VERSION, 1);
+    assert.deepEqual(record.event, JSON.parse(serializeEvent(FIXTURES[0]!)));
+    // The historical, unversioned rendering is untouched: no `v` leaks in.
+    assert.equal("v" in (JSON.parse(serializeEvent(FIXTURES[0]!)) as object), false);
+  });
+
+  it("identifies a legacy bare line as version 0", () => {
+    const parsed = parseEventRecord(serializeEvent(FIXTURES[1]!));
+    assert.equal(parsed.version, 0);
+    assert.deepEqual(parsed.event, JSON.parse(serializeEvent(FIXTURES[1]!)));
+  });
+
+  it("round-trips a v1 record and keeps it JSON-safe", () => {
+    // `FIXTURES[2]` carries a u64 bigint, which `JSON.stringify` throws on.
+    const parsed = parseEventRecord(serializeEventRecord(FIXTURES[2]!));
+    assert.equal(parsed.version, 1);
+    assert.deepEqual(parsed.event.data, { at: "1789393232" });
+    assert.equal(parsed.event.kind, "heartbeat");
+  });
+
+  it("surfaces a newer envelope version instead of guessing at it", () => {
+    const parsed = parseEventRecord('{"v":99,"event":{"id":"future"}}');
+    assert.equal(parsed.version, 99);
+    assert.deepEqual(parsed.event, { id: "future" });
+  });
+
+  it("rejects a malformed envelope rather than decoding it", () => {
+    assert.throws(() => parseEventRecord("[]"), TypeError);
+    assert.throws(() => parseEventRecord('{"v":0,"event":{}}'), TypeError);
+    assert.throws(() => parseEventRecord('{"v":1,"event":null}'), TypeError);
+    assert.throws(() => parseEventRecord("not json"), SyntaxError);
   });
 });

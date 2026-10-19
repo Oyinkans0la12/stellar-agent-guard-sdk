@@ -818,6 +818,27 @@ await hb.stop();
 - `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and it resolves once an in-flight beat has settled.
 - When the grace window is readable (`graceSecs`, or a `readPolicy` read), an interval longer than `grace / 3` throws `HeartbeatIntervalError` **before** the first beat; an unreadable policy warns via `onWarning` and starts anyway.
 - A beat that would fall in the same wall-clock second as the previous accepted one is skipped client-side; the contract deduplicates independently.
+- Every input is validated **before** the scheduler starts: a negative or non-finite `maxSkewMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, or an unusable retry budget is rejected with an error naming the field — before the first beat, and before the grace window is even read from the chain.
+
+#### Bounded retry for a transient outage
+
+A failed heartbeat used to wait for the next fixed interval, so an RPC outage that landed near the grace boundary could freeze the account even after connectivity returned. `retry` adds a bounded, jittered recovery:
+
+```ts
+const hb = await startHeartbeat({
+  server,
+  guard: GUARD_ID,
+  signer: agentKeypair,
+  intervalMs: 30_000,
+  retry: { maxAttempts: 3 },   // opt-in — the default is one attempt per beat
+  onWarning: (message) => logger.warn(message),
+  onError: (error) => logger.error("heartbeat failed", error),
+});
+```
+
+- Only a **transport** failure is retried (a `BroadcastError`, an `RpcTimeoutError`, a `SimulationError`). A **policy block is never retried**: the guard made a decision, and hammering a call it has already refused only adds load. An error the SDK cannot classify is reported, not retried.
+- The delay before the next attempt is a full-jitter sample of a bounded window, so agents that hit the same outage do not retry in a synchronized herd.
+- The attempt that failed and the delay before the next one are announced through `onWarning`; the failure that ends the beat is reported once through `onError`, with the original error. A successful beat reports how many attempts it took in `onBeat`'s `attempt`.
 
 The combined heartbeat-loop + pre-flight pattern is tracked as an integration guide in [#74](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/74).
 
@@ -839,6 +860,7 @@ The combined heartbeat-loop + pre-flight pattern is tracked as an integration gu
 - `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing. `options.signal` / `options.timeoutMs` stop a stalled run: the bound is reported through `invoke`'s `error` outcome as a typed `RpcTimeoutError`.
 - `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). See “Keep the dead-man switch alive”.
 - `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses.
+- `HeartbeatBlockedError` / `isRetryableHeartbeatFailure(error)` — The typed refusal of a blocked heartbeat, and the classifier that decides whether a failure is a transport failure (retryable) or a decision (never retried). See [Bounded retry for a transient outage](#bounded-retry-for-a-transient-outage).
 
 #### Fee units: stroops and XLM
 
@@ -873,6 +895,27 @@ await hb.stop();
 - `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and it resolves once an in-flight beat has settled.
 - When the grace window is readable (`graceSecs`, or a `readPolicy` read), an interval longer than `grace / 3` throws `HeartbeatIntervalError` **before** the first beat; an unreadable policy warns via `onWarning` and starts anyway.
 - A beat that would fall in the same wall-clock second as the previous accepted one is skipped client-side; the contract deduplicates independently.
+- Every input is validated **before** the scheduler starts: a negative or non-finite `maxSkewMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, or an unusable retry budget is rejected with an error naming the field — before the first beat, and before the grace window is even read from the chain.
+
+#### Bounded retry for a transient outage
+
+A failed heartbeat used to wait for the next fixed interval, so an RPC outage that landed near the grace boundary could freeze the account even after connectivity returned. `retry` adds a bounded, jittered recovery:
+
+```ts
+const hb = await startHeartbeat({
+  server,
+  guard: GUARD_ID,
+  signer: agentKeypair,
+  intervalMs: 30_000,
+  retry: { maxAttempts: 3 },   // opt-in — the default is one attempt per beat
+  onWarning: (message) => logger.warn(message),
+  onError: (error) => logger.error("heartbeat failed", error),
+});
+```
+
+- Only a **transport** failure is retried (a `BroadcastError`, an `RpcTimeoutError`, a `SimulationError`). A **policy block is never retried**: the guard made a decision, and hammering a call it has already refused only adds load. An error the SDK cannot classify is reported, not retried.
+- The delay before the next attempt is a full-jitter sample of a bounded window, so agents that hit the same outage do not retry in a synchronized herd.
+- The attempt that failed and the delay before the next one are announced through `onWarning`; the failure that ends the beat is reported once through `onError`, with the original error. A successful beat reports how many attempts it took in `onBeat`'s `attempt`.
 
 The combined heartbeat-loop + pre-flight pattern is tracked as an integration guide in [#74](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/74).
 
@@ -898,6 +941,7 @@ one-shot form.
 - `policyToScVal(policy: PolicyConfig): xdr.ScVal` — Encodes a policy as the contract's canonical sorted ScVal struct.
 - `decodePolicy(scVal: xdr.ScVal): PolicyConfig` — Strictly decodes `policy()`/set-policy ScVal data, including Option/Vec and numeric normalization.
 - `policyFromScVal(scVal)` — Alias for callers using the issue's original function name.
+- `describePolicy(policy: PolicyConfig | null, options?: DescribePolicyOptions): string` — A compact, log-friendly rendering of the policy in force, including the recipient caps, the blocklist and the active window with its state. Recipient lists are reported as counts unless `detail: true` asks for the addresses.
 - `invoke(options)` / `invoke({ ...options, dryRun: true })` — Broadcasts an admissible result, or returns the full pre-broadcast dry-run trace.
 - `verifyAgentSignature(publicKey, payload, signature): boolean` — Verify-only Ed25519 check against a strkey or raw 32-byte key.
 - `GuardError`, `SimulationError`, `SigningError`, `BroadcastError`, `PolicyDecodeError`, and `ContractResponseError` — Typed failure hierarchy.
@@ -932,6 +976,8 @@ const recentWindow = listener.recent({ fromLedger: 4_700_000 });
 ```
 
 `recent(filter?)` returns the retained events oldest-first, filtered by any of `stream`, `reason`, `fromLedger`, `toLedger`. The buffer is FIFO and non-durable: it holds only what this listener decoded in this process, and a restart empties it. Persistence across restarts is a cursor store (tracked separately), not something this buffer pretends to provide.
+
+What it returns is a **detached snapshot**: the array, the events in it, their decoded `data`/`decision` and the opt-in `raw` payload are all copies, so editing a returned event cannot change what the listener still retains. A listener with no `buffer` configured copies nothing — `recent()` returns `[]`.
 
 #### Raw events for bug reports (issue #94)
 

@@ -28,6 +28,15 @@ events via `poll()`/`watch()`, diagnostic events via `watchAll()`, and failed
 transaction events via `pollFailedTransactions()` or `watch()` when `failedTx`
 is enabled.
 
+**Detached snapshots (issue #344).** What this returns is a snapshot, not a view
+into the buffer: the array, the events in it, their decoded `decision` and
+`data`, and the opt-in `raw` payload are all copies. Editing a returned event
+cannot change what the listener still retains, and the next `recent()` reports
+the retained event rather than the edit. The copy keeps the prototype of a
+class instance, so an XDR value inside a `raw` payload still behaves like the
+XDR value it was. With no `buffer` configured there is nothing to copy: the
+call returns `[]` and allocates nothing.
+
 ### `pollFailedTransactions(params?): Promise<FailedTxPollResult>`
 
 Reads one page from the independent `getTransactions` cursor. Pass the returned
@@ -42,7 +51,32 @@ Set `failedTx: true` in the constructor options to include failed-transaction
 diagnostics; this scan maintains its own cursor and does not advance the
 committed event cursor.
 Parameters include `startLedger`, `cursor`/`resumeLedger`, `pollIntervalMs`, `limit`,
-`jitter`, `rng`, `sleep`, `onGap`, and `signal`.
+`jitter`, `rng`, `sleep`, `onGap`, `onUnknownTopics`, and `signal`.
+
+#### Unknown topics
+
+Unknown name topics are dropped from `GuardEvent` delivery, but they are no longer
+silent. `poll()` returns `unknownTopics: GuardUnknownTopic[]` on each page, and
+`watch()`/`watchAll()` accept `onUnknownTopics(unknownTopics)`, called once per
+page that contains at least one unrecognised event. Each entry is
+`{ topic: string; count: number }`, sorted by topic; only decoded names and counts
+are exposed — never raw XDR or the source payload. The callback is isolated like
+`onGap`, so a throwing sink cannot stop the stream. See
+[`docs/event-schema.md`](../event-schema.md#unknown-event-topics--observability-without-payloads).
+
+#### One active stream per listener
+
+A listener owns shared cursor, failed-transaction de-duplication, counter, and
+buffer state, so it supports **one active `watch()`/`watchAll()` stream at a
+time**. Starting a second stream while the first is still being pulled throws
+`ConcurrentTelemetryStreamError` (`code: "telemetry.concurrent_stream"`) before
+it issues an RPC request, saves a cursor, or records an event. The active stream
+keeps its own progress; after it ends, a new stream can start from the saved
+cursor. Use a separate listener when you need two independent streams.
+
+This is a deliberate fail-fast model, not isolation: rejecting the second stream
+is what makes cursor persistence and counters impossible to overwrite or
+double-count from two iterators on one listener.
 
 #### Mid-watch failures (`onStreamError`)
 
@@ -109,6 +143,22 @@ The returned object is a deep snapshot: mutating it never affects the listener's
 state. When `counters` is not set, `stats()` returns `null` and no counter
 structures are allocated.
 
+`windowStart` is on the counter's **monotonic** timeline, not a raw wall-clock
+reading. Observations are clamped to a non-decreasing internal time, so a
+backward clock step (NTP correction, host move, manual date change) cannot
+extend how long an entry is retained; a forward jump expires stale entries
+immediately. For an empty window it reports the current monotonic time. Do not
+compare it with `Date.now()`; use it as the start of the retained interval.
+
+### `poll()` dropped-event counts
+
+`poll()` re-checks the emitting `contractId` before decoding rather than
+trusting the RPC's contract filter. `PollResult.dropped` reports every rejection
+by reason — `unknownTopic`, `foreignContract`, `missingContractId`,
+`malformedContractId` — and the same breakdown is logged with the page summary.
+Events with missing or malformed identity fail closed. See
+[`event-schema.md`](../event-schema.md#emitting-identity-validation-before-decode-issue-322).
+
 ## Event identity
 
 Every decoded `GuardEvent` carries a stable, non-null `id` on both streams:
@@ -121,6 +171,40 @@ Every decoded `GuardEvent` carries a stable, non-null `id` on both streams:
 The same event re-parsed yields the same id; two different blocks within one
 simulation yield different ids. Format and collision notes:
 [`docs/event-schema.md`](../event-schema.md#event-identity--guardeventid).
+
+## Strict offline fixture validation
+
+`decodeGuardEventXdr()` is intentionally resilient: it returns `null` for a
+malformed or unrecognised payload so live monitoring never crashes on one bad
+event. Fixture maintainers and incident tooling need the opposite — every input
+accounted for. `validateGuardEventXdr()` is the separate strict entry point:
+
+```ts
+import { validateGuardEventXdr } from "stellar-agent-guard-sdk";
+
+const report = validateGuardEventXdr(fixtureXdr, { source: "ledger" });
+if (!report.ok) {
+  for (const failure of report.failures) {
+    console.error(failure.path, failure.stage, failure.code, failure.message);
+  }
+}
+```
+
+The report preserves input order: `events` contains the decoded decisions,
+`results` contains one entry per input, and `failures` contains only rejections.
+Each failure carries the input `index`, a stable `path` such as
+`events[2].topics[0]`, a pipeline `stage`, and a stable `code`:
+
+| Stage | Codes | Meaning |
+| --- | --- | --- |
+| `input` | `input.not_string`, `input.empty` | The entry is not a non-empty base64 string. |
+| `xdr` | `xdr.unparseable` | The value is neither a `DiagnosticEvent` nor a `ContractEvent` XDR. |
+| `topics` | `topics.missing` | The event carries no contract-event topic list. |
+| `topic` | `topic.undecodable` | One topic is not a decodable `ScVal`; the path names its index. |
+| `decision` | `decision.unknown_topic`, `decision.invalid_result` | The topics decoded, but are not an `event_auth_checked` decision with an `allowed`/`blocked` result. |
+
+Resilient live polling and the existing decoder return values are unchanged;
+this is an additive offline API.
 
 ## Cursor persistence (`cursorStore`)
 

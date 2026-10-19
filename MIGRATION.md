@@ -248,3 +248,43 @@ const interceptor = new PreFlightInterceptor({
 ```
 
 However, this negates the safety benefit. We recommend fixing your code to use type guards properly instead.
+
+## Telemetry records: explicit versioning (issues #322, #323)
+
+### `serializeEventRecord()` and `parseEventRecord()`
+
+`serializeEvent()` is unchanged: it remains the Stable, unversioned (v0) JSON
+format it has always been, so no existing log consumer breaks. Persisted
+telemetry can opt in to an envelope instead:
+
+```ts
+// Before — bare v0 line, still supported
+const line = serializeEvent(event);
+
+// After — explicit envelope, recommended for stored records
+const line = serializeEventRecord(event);
+// {"v":1,"event":{"id":"ledger:…","kind":"auth_checked",…}}
+```
+
+Reading both generations is one call:
+
+```ts
+const { version, event } = parseEventRecord(line);
+// version: 0 for legacy bare lines, 1 for the current envelope
+```
+
+No rewrite of stored data is required: legacy lines are identified by the
+absence of `v` and still parse. A line with a `v` greater than
+`TELEMETRY_EVENT_RECORD_VERSION` is reported as-is so the reader can detect a
+record written by a newer SDK. See [`docs/event-schema.md`](./docs/event-schema.md)
+for the full policy and the golden fixture.
+
+### `poll()` now validates emitting contract identity
+
+`GuardTelemetryListener.poll()` re-checks the emitting `contractId` before
+decoding, rather than trusting the RPC's contract filter. Events from another
+contract, and events whose identity is missing or malformed, are dropped and
+counted in the new `PollResult.dropped` object. If a custom RPC omits
+`contractId` for committed events, those events will now be dropped (fail
+closed); use an RPC that reports it, or consume the diagnostic streams that
+already attribute events to the configured guard.

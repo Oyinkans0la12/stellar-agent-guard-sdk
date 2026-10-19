@@ -18,6 +18,47 @@ The Stellar Agent Guard SDK exposes the following public surface. For the narrat
 - `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing.
 - `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). See “Keep the dead-man switch alive”.
 - `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses.
+- `HeartbeatIntervalError` — Thrown before the first beat when the requested interval exceeds `grace / 3`.
+- `HeartbeatBlockedError` — The guard refused the heartbeat. A refusal is a decision, not a transport failure, so it is never retried (issue #340).
+- `isRetryableHeartbeatFailure(error): boolean` — True only for the transport failures a bounded retry can plausibly fix: a `BroadcastError`, an `RpcTimeoutError`, a `SimulationError`. A policy refusal and an unclassifiable error are both `false` (issue #340).
+- `DEFAULT_HEARTBEAT_RETRY_OPTIONS` — The retry defaults: `maxAttempts: 1` (retries are opt-in), `baseDelayMs: 250`, `maxDelayMs: 5_000` (issue #340).
+
+#### Heartbeat input validation (issue #341)
+
+`startHeartbeat()` validates its inputs **before** the scheduler exists, so a misconfiguration can never reach the first beat — and never even reads the grace window from the chain. Each failure names the offending field:
+
+| Input | Accepted | Rejected |
+| --- | --- | --- |
+| `intervalMs` | a positive, finite number | `0`, negatives, `NaN`, `Infinity` (`RangeError`) |
+| `maxSkewMs` | a finite, non-negative number | negatives, `NaN`, `±Infinity` (`RangeError`) |
+| `graceSecs` | a non-negative `bigint`, or a non-negative **safe integer** | negatives, fractions, `NaN`, `±Infinity`, values beyond `Number.MAX_SAFE_INTEGER` (`RangeError`); a non-number, non-bigint (`TypeError`) |
+| `onBeat`, `onError`, `onWarning`, `readPolicy`, `submit`, `now`, `wait` | a function | anything else (`TypeError`) |
+| `retry.maxAttempts` | an integer `>= 1` | `0`, negatives, fractions (`RangeError`) |
+| `retry.baseDelayMs`, `retry.maxDelayMs` | a finite number `>= 0` | negatives, `NaN`, `±Infinity` (`RangeError`) |
+
+A rejected `startHeartbeat()` submits nothing and reads no policy.
+
+#### Bounded retry and backoff (issue #340)
+
+A failed heartbeat used to wait for the next fixed interval before trying again — so an RPC outage that landed near the grace boundary could freeze an account even after connectivity returned. `retry` adds a bounded, jittered retry:
+
+```ts
+const hb = await startHeartbeat({
+  server,
+  guard: GUARD_ID,
+  signer: agentKeypair,
+  intervalMs: 30_000,
+  retry: { maxAttempts: 3 },        // opt-in: the default is one attempt per beat
+  onWarning: (message) => logger.warn(message),
+  onError: (error) => logger.error("heartbeat failed", error),
+});
+```
+
+- **Only transport failures are retried**: a `BroadcastError`, an `RpcTimeoutError` or a `SimulationError`. A **policy block is never retried** — the guard made a decision, and hammering a call it has already refused only adds load. An error the SDK cannot classify is reported, not retried.
+- The delay before attempt *n* is a full-jitter sample of `[0, min(maxDelayMs, baseDelayMs · 2ⁿ⁻¹))`, so agents that hit the same outage do not retry in a synchronized herd. `retry.random` makes it deterministic.
+- The attempt that failed and the delay before the next one are announced through `onWarning`; the failure that ends the beat is reported **once** through `onError`, with the original error. Nothing escapes as an unhandled rejection.
+- A successful beat reports how many attempts it took in `onBeat`'s `attempt`.
+- The backoff uses the same abortable wait as the cadence, so `stop()` (or an abort) ends it at once and starts no further attempt.
 
 #### Fee units: stroops and XLM
 
@@ -93,12 +134,15 @@ one-shot form.
   - `constructor(options: GuardTelemetryListenerOptions)`
   - `watch(params?: GuardTelemetryWatchParams): AsyncIterable<GuardEventPage>` — Tails on-chain and uncommitted events. `params.signal` aborts at loop boundaries: no RPC call before the first pull, no poll after an abort, and the delay between polls is cut short. A request already in flight cannot be cancelled — see [Aborting a watch](../README.md#aborting-a-watch-what-cancellation-does-and-does-not-cover).
   - `watchAll(params?: GuardTelemetryUnifiedParams): AsyncIterable<GuardEvent>` — Merges the committed ledger stream with the `diagnostics` batches you feed it into **one ordered, de-duplicated stream**, so a single loop sees blocked decisions too. Each event carries `stream: 'committed' | 'diagnostic'` and, for diagnostics, `observedAt`. Ordering and de-duplication rules: [`event-schema.md`](event-schema.md).
-  - `serializeEvent(event: GuardEvent): string` — Canonical single-line JSON for deterministic JSON-lines log shipping. Fixed key order, drops `undefined`, keeps `null`, renders `bigint` as a decimal string. Contract: [`event-schema.md`](event-schema.md#canonical-json-serialization--serializeevent).
+  - `serializeEvent(event: GuardEvent): string` — Canonical single-line JSON for deterministic JSON-lines log shipping. Fixed key order, drops `undefined`, keeps `null`, renders `bigint` as a decimal string. Unversioned legacy (v0) format. Contract: [`event-schema.md`](event-schema.md#canonical-json-serialization--serializeevent).
+  - `serializeEventRecord(event: GuardEvent): string` — Persisted-record envelope `{ "v": 1, "event": { … } }` with the same event projection as `serializeEvent()`; `v` is explicit so a reader can tell a record written by a newer SDK. See [Versioned event records](event-schema.md#versioned-event-records--serializeeventrecord-issue-323).
+  - `parseEventRecord(line: string): { version, event }` — Reads either a versioned envelope or a legacy bare line (reported as `version: 0`).
 - `validateGuardPolicy(policy: unknown, options?: ValidatePolicyOptions | string): PolicyFailure[]` — Validates policy configuration against SPEC §8 rules prior to broadcast, accumulating all failures for complete form UX.
 - `POLICY_RULE_IDS` — Canonical array of SPEC §8 validation rule identifiers.
 - `policyToScVal(policy: PolicyConfig): xdr.ScVal` — Encodes a policy as the contract's canonical sorted ScVal struct.
 - `decodePolicy(scVal: xdr.ScVal): PolicyConfig` — Strictly decodes `policy()`/set-policy ScVal data, including Option/Vec and numeric normalization.
 - `policyFromScVal(scVal)` — Alias for callers using the issue's original function name.
+- `describePolicy(policy: PolicyConfig | null, options?: DescribePolicyOptions): string` — A compact, log-friendly rendering of the policy in force. See [Describing a policy](#describing-a-policy-issue-343).
 - `invoke(options)` / `invoke({ ...options, dryRun: true })` — Broadcasts an admissible result, or returns the full pre-broadcast dry-run trace.
 - `verifyAgentSignature(publicKey, payload, signature): boolean` — Verify-only Ed25519 check against a strkey or raw 32-byte key.
 - `GuardError`, `SimulationError`, `SigningError`, `BroadcastError`, `PolicyDecodeError`, and `ContractResponseError` — Typed failure hierarchy.
@@ -133,6 +177,20 @@ const recentWindow = listener.recent({ fromLedger: 4_700_000 });
 ```
 
 `recent(filter?)` returns the retained events oldest-first, filtered by any of `stream`, `reason`, `fromLedger`, `toLedger`. The buffer is FIFO and non-durable: it holds only what this listener decoded in this process, and a restart empties it. Persistence across restarts is a cursor store (tracked separately), not something this buffer pretends to provide.
+
+#### Detached snapshots from `recent()` (issue #344)
+
+`recent()` returns **detached snapshots**, not references into the buffer's own state. The array is new, and so is every event in it: the top-level fields, the decoded `decision`, the decoded `data`, and the opt-in `raw` payload are all copies. A consumer that edits what it was handed cannot change what the listener still retains, and the next `recent()` reports the retained event rather than the consumer's edit.
+
+```ts
+const snapshot = listener.recent();
+snapshot[0]!.ledger = 999;                 // the copy
+snapshot[0]!.data = { forged: true };      // the copy
+
+listener.recent()[0]!.ledger;              // → the retained ledger, unchanged
+```
+
+The copy is structural rather than a re-serialisation: byte arrays are copied, and a class instance keeps its prototype, so an XDR value inside a `raw` payload still answers like the XDR value it was. The cost is paid per call by a caller that actually reads a snapshot — a listener with **no** `buffer` configured allocates nothing at all, and `recent()` returns `[]`.
 
 #### Raw events for bug reports (issue #94)
 
@@ -187,3 +245,35 @@ for await (const event of listener.watchAll({ diagnostics })) {
 ```
 
 Key order, the drop-`undefined`/keep-`null` policy, and the `bigint`-to-decimal-string normalization are documented in [`event-schema.md`](event-schema.md#canonical-json-serialization--serializeevent).
+
+For **persisted** records, prefer the versioned envelope so a future schema change is distinguishable from a historical line:
+
+```ts
+import { parseEventRecord, serializeEventRecord } from "stellar-agent-guard-sdk";
+
+logger.info(serializeEventRecord(event)); // {"v":1,"event":{…}}
+const { version, event: decoded } = parseEventRecord(storedLine); // version 0 = legacy
+```
+
+#### Describing a policy (issue #343)
+
+`describePolicy(policy)` renders the policy in force as one log-friendly line. The summary is **complete**: it names the constraints that materially change which transfers are allowed — the per-recipient window caps, the blocked recipients, and the active window with its state — so a reader never has to open the policy to learn that it is narrower than the first line suggests.
+
+```ts
+import { describePolicy } from "stellar-agent-guard-sdk";
+
+describePolicy(policy);
+// per-tx cap 1000, rolling window 150 / 60s, 1 asset(s), 1 allowlisted recipient(s),
+// 0 allowlisted protocol(s), active, dead-man switch off, 2 blocked recipient(s),
+// 1 per-recipient window cap(s), active window 2026-01-01T00:00:00.000Z ->
+// 2026-02-01T00:00:00.000Z (active)
+```
+
+- **Quiet by default.** Recipient lists are reported as counts, never as addresses: a summary is a log line, and a policy can name hundreds of recipients. `detail: true` is the explicit way to ask for the addresses themselves (the allowlist, the blocklist and the per-recipient caps).
+- **Stable output.** The recipient lists are sorted, so the same policy always renders the same way regardless of the order the policy stores them in.
+- **The active window is judged against a moment.** `nowSecs` (a number or a bigint) pins that moment; it defaults to the current time. The state is one of `unbounded` (no window), `scheduled` (not open yet), `active`, or `expired`.
+- An optional constraint that is absent and one that is empty are the same thing — the constraint is not in force — so neither produces a clause. A boundary a `Date` cannot represent is rendered as raw seconds instead of throwing.
+
+```ts
+describePolicy(policy, { detail: true, nowSecs: 1_700_000_000 });
+```

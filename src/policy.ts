@@ -672,19 +672,181 @@ export function deadManRemaining(status: GuardStatus, policy: ReadonlyPolicyConf
   return status.last_heartbeat + policy.dms_grace_secs - status.now;
 }
 
-/** A compact, log-friendly rendering of the policy in force. */
-export function describePolicy(policy: ReadonlyPolicyConfig | null): string {
+/**
+ * Where a policy's active window stands at a given moment.
+ *
+ * - `unbounded` — no window at all: `active_from` and `active_until` are both 0.
+ * - `scheduled` — the window has not opened yet (`now < active_from`).
+ * - `active` — the window is open.
+ * - `expired` — the window closed (`active_until` is set and `now >= active_until`).
+ */
+export type ActiveWindowState = "unbounded" | "scheduled" | "active" | "expired";
+
+/**
+ * Options for `describePolicy`.
+ */
+export interface DescribePolicyOptions {
+  /**
+   * Include the full recipient lists — the allowlist, the blocked recipients
+   * and the per-recipient window caps — instead of their counts.
+   *
+   * Off by default: a summary is a log line, and a policy can name hundreds of
+   * recipients. The counts are what an operator scans for; the lists are what
+   * an operator needs once the count itself is the surprise.
+   */
+  detail?: boolean;
+  /**
+   * The moment the active window is judged against, in unix seconds.
+   *
+   * Defaults to the current time. Pass it to make the summary reproducible —
+   * a dashboard snapshot, a test, a diff between two reports.
+   */
+  nowSecs?: number | bigint;
+}
+
+/**
+ * The active-window state of a policy at `nowSecs`.
+ *
+ * `0` means "unset" on both bounds, exactly as the contract reads it: an
+ * `active_from` of 0 does not start the policy at the epoch, it means the
+ * policy was never restricted, and an `active_until` of 0 means the policy
+ * never expires.
+ */
+function activeWindowState(
+  activeFrom: bigint,
+  activeUntil: bigint,
+  nowSecs: bigint,
+): ActiveWindowState {
+  if (activeFrom === 0n && activeUntil === 0n) return "unbounded";
+  if (activeFrom > nowSecs) return "scheduled";
+  if (activeUntil > 0n && nowSecs >= activeUntil) return "expired";
+  return "active";
+}
+
+/**
+ * A unix-seconds boundary, as an ISO timestamp when it fits one.
+ *
+ * A policy is not required to carry a timestamp a `Date` can represent, and
+ * `toISOString()` throws on an out-of-range instant — so an unrepresentable
+ * boundary is rendered as the raw seconds instead of taking the whole summary
+ * down with it.
+ */
+function formatUnixSeconds(seconds: bigint): string {
+  const millis = Number(seconds) * 1000;
+  if (!Number.isFinite(millis) || Math.abs(millis) > 8.64e15) return `${seconds}s`;
+  return new Date(millis).toISOString();
+}
+
+/**
+ * The active window of a policy, as one clause: its bounds and its state.
+ *
+ * The bounds are always reported; the state says whether the policy is
+ * enforceable *right now*, which is the part an operator cannot read off the
+ * numbers alone.
+ */
+function describeActiveWindow(
+  activeFrom: bigint,
+  activeUntil: bigint,
+  nowSecs: bigint,
+): string {
+  const state = activeWindowState(activeFrom, activeUntil, nowSecs);
+  if (state === "unbounded") return "no active window";
+  const from = activeFrom === 0n ? "always" : formatUnixSeconds(activeFrom);
+  const until = activeUntil === 0n ? "never" : formatUnixSeconds(activeUntil);
+  return `active window ${from} -> ${until} (${state})`;
+}
+
+/**
+ * The recipient-specific constraints of a policy, as summary clauses.
+ *
+ * Both lists are optional on the policy: an absent list and an empty list
+ * mean the same thing — the constraint is not in force — so neither produces a
+ * clause. A policy that carries one is reported, because a summary that calls
+ * a policy with a blocklist "broadly permissive" is worse than no summary at
+ * all.
+ */
+function describeRecipientConstraints(
+  policy: ReadonlyPolicyConfig,
+  detail: boolean,
+): string[] {
+  const parts: string[] = [];
+  const blocked = policy.blocked_recipients ?? [];
+  if (blocked.length > 0) {
+    parts.push(
+      detail
+        ? `blocked recipients: ${[...blocked].sort().join(", ")}`
+        : `${blocked.length} blocked recipient(s)`,
+    );
+  }
+  const caps = policy.recipient_window_caps ?? [];
+  if (caps.length > 0) {
+    parts.push(
+      detail
+        ? `per-recipient window caps: ${[...caps]
+            .sort((a, b) => compareRecipientCaps(a, b))
+            .map((cap) => `${cap.recipient} -> ${cap.cap}`)
+            .join(", ")}`
+        : `${caps.length} per-recipient window cap(s)`,
+    );
+  }
+  return parts;
+}
+
+/** Order two per-recipient caps by recipient, then by cap — a stable order. */
+function compareRecipientCaps(
+  a: Readonly<RecipientWindowCap>,
+  b: Readonly<RecipientWindowCap>,
+): number {
+  if (a.recipient !== b.recipient) return a.recipient < b.recipient ? -1 : 1;
+  if (a.cap === b.cap) return 0;
+  return a.cap < b.cap ? -1 : 1;
+}
+
+/**
+ * The moment the active window is judged against, in whole unix seconds.
+ */
+function describeNowSecs(value: number | bigint | undefined): bigint {
+  if (value === undefined) return BigInt(Math.floor(Date.now() / 1000));
+  if (typeof value === "bigint") return value;
+  if (!Number.isFinite(value)) {
+    throw new RangeError(`describePolicy nowSecs must be a finite number, received ${value}`);
+  }
+  return BigInt(Math.floor(value));
+}
+
+/**
+ * A compact, log-friendly rendering of the policy in force.
+ *
+ * The summary is **complete**: it names the constraints that materially change
+ * which transfers are allowed — the per-recipient window caps, the blocked
+ * recipients, and the active window with its state — so a reader never has to
+ * open the policy to learn that it is narrower than the first line suggests.
+ *
+ * It is also **quiet by default**: recipient lists are reported as counts, and
+ * `detail: true` is the explicit way to ask for the addresses themselves. The
+ * recipient lists are sorted, so the same policy always renders the same way.
+ */
+export function describePolicy(
+  policy: ReadonlyPolicyConfig | null,
+  options?: DescribePolicyOptions,
+): string {
   if (!policy) return "no policy installed (default-deny: every action is blocked)";
+  const detail = options?.detail === true;
+  const nowSecs = describeNowSecs(options?.nowSecs);
   const parts = [
     `per-tx cap ${policy.per_tx_cap}`,
     `rolling window ${policy.window_cap} / ${policy.window_secs}s`,
     `${policy.assets.length} asset(s)`,
     policy.allow_any_recipient
       ? "any recipient"
-      : `${policy.recipients.length} allowlisted recipient(s)`,
+      : detail
+        ? `allowlisted recipients: ${[...policy.recipients].sort().join(", ")}`
+        : `${policy.recipients.length} allowlisted recipient(s)`,
     `${policy.protocols.length} allowlisted protocol(s)`,
     policy.paused ? "PAUSED" : "active",
     policy.dms_grace_secs > 0n ? `dead-man grace ${policy.dms_grace_secs}s` : "dead-man switch off",
+    ...describeRecipientConstraints(policy, detail),
+    describeActiveWindow(policy.active_from, policy.active_until, nowSecs),
   ];
   return parts.join(", ");
 }

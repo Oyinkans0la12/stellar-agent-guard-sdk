@@ -85,6 +85,11 @@ export {
   validateGuardPolicy,
 } from "./policy.ts";
 
+export type {
+  ActiveWindowState,
+  DescribePolicyOptions,
+} from "./policy.ts";
+
 export { DMS_WARN_RATIO_DEFAULT, dmsUrgency } from "./dms.ts";
 export { policyDiff } from "./policy-diff.ts";
 export type { PolicyChange, PolicyValue } from "./policy-diff.ts";
@@ -129,11 +134,19 @@ export {
   decodeGuardEventXdr,
   GUARD_AUTH_RESULTS,
   GUARD_EVENT_TOPICS,
+  validateGuardEventXdr,
 } from "./events.ts";
 
 export type {
   GuardAuthDecision,
   GuardAuthResult,
+  GuardEventValidationCode,
+  GuardEventValidationEntry,
+  GuardEventValidationFailure,
+  GuardEventValidationOptions,
+  GuardEventValidationReport,
+  GuardEventValidationStage,
+  GuardEventValidationSuccess,
 } from "./events.ts";
 
 export {
@@ -214,10 +227,12 @@ export type {
 } from "./cost.ts";
 
 export {
+  ConcurrentTelemetryStreamError,
   DEFAULT_JITTER_FRACTION,
   GuardEventRingBuffer,
   GuardTelemetryListener,
   InMemoryCursorStore,
+  compareCommittedEvents,
   computePollDelay,
   describeGuardEvent,
   diagnosticsToEvents,
@@ -226,22 +241,29 @@ export {
   guardEventsFromFailedTransaction,
   isAllowedDecision,
   mergeGuardEventStreams,
+  parseEventRecord,
   serializeEvent,
+  serializeEventRecord,
   telemetryFromDecision,
+  TELEMETRY_EVENT_RECORD_VERSION,
   type CursorStore,
   type GuardDiagnosticBatch,
   type GuardEvent,
   type GuardEventBufferOptions,
   type GuardEventContext,
   type GuardEventDecodeOptions,
+  type GuardEventDropCounts,
   type GuardEventIdentityInput,
   type GuardEventKind,
+  type GuardEventRecord,
   type GuardEventStream,
   type GuardTelemetryConfig,
   type GuardTelemetryGap,
   type GuardTelemetryGapReason,
   type GuardTelemetryUnifiedParams,
   type GuardTelemetryWatchParams,
+  type GuardUnknownTopic,
+  type ParsedGuardEventRecord,
   type PollResult,
   type PollSleep,
   type RecentEventFilter,
@@ -303,12 +325,16 @@ export {
 } from "./wasm.ts";
 
 export {
+  DEFAULT_HEARTBEAT_RETRY_OPTIONS,
+  HeartbeatBlockedError,
   HeartbeatIntervalError,
+  isRetryableHeartbeatFailure,
   startHeartbeat,
   submitHeartbeat,
   type HeartbeatBeat,
   type HeartbeatHandle,
   type HeartbeatOptions,
+  type HeartbeatRetryOptions,
   type HeartbeatSubmission,
   type SubmitHeartbeatParams,
 } from "./heartbeat.ts";

@@ -20,8 +20,10 @@
  */
 import { Keypair, rpc } from "@stellar/stellar-sdk";
 import { DEFAULT_NETWORK_PASSPHRASE } from "./admin.ts";
-import { invoke, type InvokeOutcome } from "./invoke.ts";
+import { BroadcastError, GuardError, SimulationError } from "./errors.ts";
+import { invoke, RpcTimeoutError, type InvokeOutcome } from "./invoke.ts";
 import { unsafeContractAddress, type PolicyConfig } from "./policy.ts";
+import { explainReason, GuardBlockedError } from "./reasons.ts";
 import type { AgentSigner, AdminSigner } from "./tx.ts";
 
 /** What one heartbeat submission reports back to the scheduler. */
@@ -44,7 +46,110 @@ export interface HeartbeatBeat {
   lateMs: number;
   /** Ledger the heartbeat committed to, when the submission reported one. */
   ledger?: number;
+  /**
+   * How many attempts this beat took (1 = the first attempt was accepted).
+   *
+   * A beat that needed a retry took more than one attempt, and an operator
+   * watching a flaky RPC wants to see that without counting callbacks. Absent
+   * only when a caller hands `onBeat` a beat of its own making.
+   */
+  attempt?: number;
 }
+
+/**
+ * The guard refused the heartbeat.
+ *
+ * A refusal is a *decision*, not a transport failure: retrying it would only
+ * add load to a call the guard has already refused, so it is never retried
+ * (see `isRetryableHeartbeatFailure`). It is reported through `onError` like
+ * any other failed beat, because a refused heartbeat does not keep the
+ * dead-man switch alive — silently treating it as a beat would be the worst
+ * possible outcome for an operator.
+ */
+export class HeartbeatBlockedError extends GuardError {
+  /** The contract's reason symbol, when the outcome carried one. */
+  readonly reason: string | null;
+  /** The pipeline's detail line, when it carried one. */
+  readonly detail: string | undefined;
+
+  constructor(params: { reason: string | null; detail?: string | undefined }) {
+    const explanation = params.reason
+      ? explainReason(params.reason)
+      : "the guard refused the heartbeat without stating a reason";
+    super(
+      `stellar-agent-guard blocked the heartbeat${params.reason ? ` (${params.reason})` : ""}: ${explanation}` +
+        (params.detail ? `\n${params.detail}` : ""),
+    );
+    this.name = "HeartbeatBlockedError";
+    this.reason = params.reason;
+    this.detail = params.detail;
+  }
+}
+
+/**
+ * True when a heartbeat submission failure is worth retrying (issue #340).
+ *
+ * Only a *transport* failure qualifies: the RPC was unreachable, the request
+ * timed out, or the simulation could not run. Those are the failures a later
+ * attempt can plausibly fix, and they are the ones that used to freeze an
+ * account when an outage landed near the grace boundary.
+ *
+ * Two things are deliberately **not** retryable:
+ *
+ * - a **policy block** (`GuardBlockedError`, `HeartbeatBlockedError`, or a
+ *   blocked `invoke` outcome): the guard made a decision, and hammering a call
+ *   it has already refused only adds load;
+ * - anything the SDK cannot classify: an unknown error is reported, not
+ *   retried, because retrying a deterministic failure is just load.
+ */
+export function isRetryableHeartbeatFailure(error: unknown): boolean {
+  if (error instanceof GuardBlockedError) return false;
+  if (error instanceof HeartbeatBlockedError) return false;
+  if (error instanceof BroadcastError) return true;
+  if (error instanceof RpcTimeoutError) return true;
+  if (error instanceof SimulationError) return true;
+  return false;
+}
+
+/**
+ * The bounded retry policy applied to a failed heartbeat submission (#340).
+ *
+ * Retries are **opt-in**: with no `retry` option the scheduler makes exactly
+ * one attempt per beat, so the SDK never adds RPC load a caller did not ask
+ * for. An operator who knows the RPC path is flaky opts in with a small
+ * budget (`{ maxAttempts: 3 }`), which is bounded by construction: the
+ * attempts per beat are capped, and the delay between them is capped too.
+ */
+export interface HeartbeatRetryOptions {
+  /**
+   * Total attempts per beat, including the first. Default 1 (no retry).
+   * Must be an integer >= 1.
+   */
+  maxAttempts?: number;
+  /**
+   * Base full-jitter window in milliseconds. Default 250. The delay before
+   * attempt *n* is a uniform sample from `[0, min(maxDelayMs, baseDelayMs *
+   * 2^(n-1)))`.
+   */
+  baseDelayMs?: number;
+  /** Upper bound for every full-jitter window in milliseconds. Default 5,000. */
+  maxDelayMs?: number;
+  /**
+   * RNG used for the full-jitter sample; it must return a value in [0, 1).
+   * Inject it to make the backoff deterministic in tests.
+   */
+  random?: () => number;
+}
+
+/** The defaults behind `HeartbeatRetryOptions` (issue #340). */
+export const DEFAULT_HEARTBEAT_RETRY_OPTIONS = {
+  /** One attempt per beat: retries are opt-in. */
+  maxAttempts: 1,
+  /** Base full-jitter window, in milliseconds. */
+  baseDelayMs: 250,
+  /** Upper bound for every full-jitter window, in milliseconds. */
+  maxDelayMs: 5_000,
+} as const;
 
 /** The running scheduler, returned by `startHeartbeat`. */
 export interface HeartbeatHandle {
@@ -116,6 +221,10 @@ export interface HeartbeatOptions {
    * Lateness tolerated before a beat counts as missed. Defaults to `0`
    * (strict): set it to your scheduler's tolerable drift (e.g. `2_000` for a
    * 30s interval) if timer jitter should not be reported as lateness.
+   *
+   * Must be a finite, non-negative number: a negative threshold would make
+   * every beat look late, and a non-finite one would make the lateness report
+   * meaningless. Both are rejected before the first beat (issue #341).
    */
   maxSkewMs?: number;
   onBeat?: (beat: HeartbeatBeat) => void;
@@ -138,10 +247,28 @@ export interface HeartbeatOptions {
    * `graceSecs` directly avoids the read.
    */
   readPolicy?: () => Promise<PolicyConfig | null>;
-  /** A known grace window, in seconds, for the pre-start interval check. */
+  /**
+   * A known grace window, in seconds, for the pre-start interval check.
+   *
+   * Accepted values: a non-negative `bigint` (exact, any size) or a
+   * non-negative safe integer. A fractional, non-finite, negative or
+   * unsafe-precision number is rejected before the scheduler starts: the
+   * `BigInt` conversion it feeds would either throw with an opaque message
+   * or silently carry a rounded value into the `interval <= grace/3` check
+   * (issue #341).
+   */
   graceSecs?: number | bigint;
   /** Warning channel. The SDK carries no logger; this keeps it that way. */
   onWarning?: (message: string) => void;
+
+  /**
+   * Bounded retry for a failed submission (issue #340).
+   *
+   * Omitted → one attempt per beat, exactly as before. A configured policy
+   * retries a *transport* failure with full-jitter backoff; a policy block is
+   * never retried.
+   */
+  retry?: HeartbeatRetryOptions;
 
   /**
    * Replace the submission step (testing seam, or a custom transport). Receives
@@ -248,6 +375,189 @@ function defaultSubmit(
 }
 
 /**
+ * Assert that an option the scheduler will call is callable.
+ *
+ * A `wait` that is not a function kills the loop on its first tick with an
+ * error nobody sees (the loop's rejection is swallowed on purpose), so the
+ * misconfiguration is caught here instead, where the stack still points at
+ * the caller's code (issue #341).
+ */
+function assertFunctionOption(name: string, value: unknown): void {
+  if (value !== undefined && typeof value !== "function") {
+    throw new TypeError(`heartbeat ${name} must be a function, received ${typeof value}`);
+  }
+}
+
+/**
+ * Validate every scheduler input before anything is scheduled or submitted
+ * (issue #341).
+ *
+ * These inputs are the difference between "the agent is late" and "the agent
+ * is misconfigured": a negative `maxSkewMs` makes every beat look late, a
+ * `NaN` or fractional grace window makes the `interval <= grace/3` check
+ * meaningless, and a non-callable `wait` kills the loop silently. All of them
+ * fail here — before the first beat, and before the grace window is even read
+ * from the chain — with an error that names the offending field.
+ */
+function assertHeartbeatOptions(options: HeartbeatOptions): void {
+  const { intervalMs } = options;
+  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+    throw new RangeError(`heartbeat intervalMs must be a positive number, received ${intervalMs}`);
+  }
+  if (options.maxSkewMs !== undefined) {
+    const maxSkewMs = options.maxSkewMs;
+    if (!Number.isFinite(maxSkewMs) || maxSkewMs < 0) {
+      throw new RangeError(
+        `heartbeat maxSkewMs must be a finite, non-negative number, received ${maxSkewMs}`,
+      );
+    }
+  }
+  if (options.graceSecs !== undefined) {
+    const graceSecs = options.graceSecs;
+    if (typeof graceSecs === "bigint") {
+      if (graceSecs < 0n) {
+        throw new RangeError(
+          `heartbeat graceSecs must be a non-negative bigint, received ${graceSecs}`,
+        );
+      }
+    } else if (typeof graceSecs === "number") {
+      // A safe integer is the only number that survives the `BigInt` conversion
+      // unchanged; a fractional one throws, and an imprecise one would carry a
+      // rounded value into the grace check.
+      if (!Number.isSafeInteger(graceSecs) || graceSecs < 0) {
+        throw new RangeError(
+          `heartbeat graceSecs must be a non-negative safe integer, received ${graceSecs}`,
+        );
+      }
+    } else {
+      throw new TypeError(
+        `heartbeat graceSecs must be a number or a bigint, received ${typeof graceSecs}`,
+      );
+    }
+  }
+  assertFunctionOption("onBeat", options.onBeat);
+  assertFunctionOption("onError", options.onError);
+  assertFunctionOption("onWarning", options.onWarning);
+  assertFunctionOption("readPolicy", options.readPolicy);
+  assertFunctionOption("submit", options.submit);
+  assertFunctionOption("now", options.now);
+  assertFunctionOption("wait", options.wait);
+  if (options.retry !== undefined) {
+    if (typeof options.retry !== "object" || options.retry === null) {
+      throw new TypeError(`heartbeat retry must be an object, received ${typeof options.retry}`);
+    }
+    assertFunctionOption("retry.random", options.retry.random);
+  }
+}
+
+/** The retry policy with every default filled in. */
+interface ResolvedHeartbeatRetry {
+  maxAttempts: number;
+  baseDelayMs: number;
+  maxDelayMs: number;
+  random: () => number;
+}
+
+/**
+ * Fill in the retry defaults and reject an unusable policy (issue #340).
+ *
+ * The bounds are checked here, before the first beat, so a typo in the retry
+ * budget cannot turn into an unbounded storm of heartbeats.
+ */
+function resolveRetryOptions(options: HeartbeatRetryOptions | undefined): ResolvedHeartbeatRetry {
+  const maxAttempts = options?.maxAttempts ?? DEFAULT_HEARTBEAT_RETRY_OPTIONS.maxAttempts;
+  const baseDelayMs = options?.baseDelayMs ?? DEFAULT_HEARTBEAT_RETRY_OPTIONS.baseDelayMs;
+  const maxDelayMs = options?.maxDelayMs ?? DEFAULT_HEARTBEAT_RETRY_OPTIONS.maxDelayMs;
+
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {
+    throw new RangeError(
+      `heartbeat retry.maxAttempts must be an integer >= 1, received ${maxAttempts}`,
+    );
+  }
+  if (!Number.isFinite(baseDelayMs) || baseDelayMs < 0) {
+    throw new RangeError(
+      `heartbeat retry.baseDelayMs must be finite and >= 0, received ${baseDelayMs}`,
+    );
+  }
+  if (!Number.isFinite(maxDelayMs) || maxDelayMs < 0) {
+    throw new RangeError(
+      `heartbeat retry.maxDelayMs must be finite and >= 0, received ${maxDelayMs}`,
+    );
+  }
+
+  return { maxAttempts, baseDelayMs, maxDelayMs, random: options?.random ?? Math.random };
+}
+
+/**
+ * Full-jitter delay before the next attempt (issue #340).
+ *
+ * The exponential value is only the window: multiplying it by an independent
+ * random sample spreads agents that hit the same RPC outage instead of
+ * releasing them in a synchronized thundering herd.
+ */
+function fullJitterDelay(attempt: number, options: ResolvedHeartbeatRetry): number {
+  const window = Math.min(
+    options.maxDelayMs,
+    options.baseDelayMs * 2 ** Math.max(0, attempt - 1),
+  );
+  const sample = options.random();
+  // A custom RNG should return [0, 1), but clamp a bad edge value rather than
+  // allowing a production retry policy to be disabled by an out-of-range sample.
+  const normalized = Number.isFinite(sample) ? Math.min(Math.max(sample, 0), 1) : 0;
+  return Math.floor(window * normalized);
+}
+
+/** A one-line rendering of a failure, for the retry warning. */
+function describeFailure(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** The result of one heartbeat submission attempt. */
+type HeartbeatAttemptResult =
+  | { ok: true; submission: HeartbeatSubmission | void }
+  | { ok: false; error: unknown; retryable: boolean };
+
+/**
+ * Run one submission attempt and classify what came back (issue #340).
+ *
+ * A heartbeat can fail in two shapes: the submission throws, or it *resolves*
+ * with an outcome that is not a success — `invoke()` reports a policy block
+ * and a pipeline failure as outcomes, not as throws. Both are failures here,
+ * because a heartbeat that was refused or that never reached the ledger does
+ * not keep the dead-man switch alive.
+ */
+async function attemptSubmission(
+  submit: (beat: HeartbeatBeat) => Promise<HeartbeatSubmission | void>,
+  beat: HeartbeatBeat,
+): Promise<HeartbeatAttemptResult> {
+  let submission: HeartbeatSubmission | void;
+  try {
+    submission = await submit(beat);
+  } catch (error) {
+    return { ok: false, error, retryable: isRetryableHeartbeatFailure(error) };
+  }
+
+  const outcome = submission?.outcome;
+  if (outcome === undefined) return { ok: true, submission };
+  if (outcome.kind === "blocked") {
+    // The guard refused the heartbeat. A refusal is a decision: it is reported
+    // and never retried.
+    return {
+      ok: false,
+      error: new HeartbeatBlockedError({ reason: outcome.reason, detail: outcome.detail }),
+      retryable: false,
+    };
+  }
+  if (outcome.kind === "error") {
+    // A pipeline failure. The typed error says whether it was a transport
+    // problem (retryable) or something the SDK cannot classify.
+    const error = outcome.error;
+    return { ok: false, error, retryable: isRetryableHeartbeatFailure(error) };
+  }
+  return { ok: true, submission };
+}
+
+/**
  * Start beating. Resolves once any pre-start grace validation has run (which is
  * why it is async), and returns a handle to the running scheduler.
  *
@@ -264,12 +574,23 @@ function defaultSubmit(
  * A beat that fires more than `maxSkewMs` past its deadline increments
  * `missedBeats` and is reported through `onBeat`'s `lateMs`. A submission
  * failure goes to `onError` and never escapes as an unhandled rejection.
+ *
+ * ## Retries (issue #340)
+ *
+ * With a `retry` policy, a *transport* failure is retried with bounded
+ * full-jitter backoff; a policy block is never retried. The attempt that
+ * failed and the delay before the next one are announced through `onWarning`,
+ * and the failure that ends the beat is reported once through `onError`.
  */
 export async function startHeartbeat(options: HeartbeatOptions): Promise<HeartbeatHandle> {
+  // Every input is checked before the scheduler exists: an invalid skew
+  // threshold, grace window or callback must not reach the first beat (issue
+  // #341), and an unusable retry budget must not become a request storm
+  // (issue #340).
+  assertHeartbeatOptions(options);
+  const retry = resolveRetryOptions(options.retry);
+
   const { intervalMs } = options;
-  if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
-    throw new RangeError(`heartbeat intervalMs must be a positive number, received ${intervalMs}`);
-  }
   const maxSkewMs = options.maxSkewMs ?? 0;
   const now = options.now ?? (() => Date.now());
   const wait = options.wait ?? defaultWait;
@@ -316,6 +637,55 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
     await loopDone;
   }
 
+  /**
+   * Submit one beat, retrying a retryable failure with bounded backoff
+   * (issue #340).
+   *
+   * The attempts and the final failure are both reported, each exactly once:
+   * the attempt that failed and the delay before the next one are announced
+   * through `onWarning`, and the failure that ends the beat is returned to
+   * the caller, which reports it through `onError`.
+   */
+  async function submitBeat(
+    beat: HeartbeatBeat,
+  ): Promise<
+    { ok: true; attempt: number; ledger?: number } | { ok: false; attempt: number; error: unknown }
+  > {
+    let attempt = 0;
+    for (;;) {
+      attempt += 1;
+      const result = await attemptSubmission(submit, beat);
+      if (result.ok) {
+        const ledger = result.submission?.ledger;
+        return {
+          ok: true,
+          attempt,
+          ...(ledger !== undefined ? { ledger } : {}),
+        };
+      }
+      // A policy block (or a failure the SDK cannot classify) is final, and so
+      // is an exhausted budget: retrying either adds load without a chance of
+      // a different answer.
+      if (!result.retryable || attempt >= retry.maxAttempts || stopped) {
+        return { ok: false, attempt, error: result.error };
+      }
+      const delay = fullJitterDelay(attempt, retry);
+      try {
+        options.onWarning?.(
+          `heartbeat submission failed on attempt ${attempt} of ${retry.maxAttempts}; ` +
+            `retrying in ${delay}ms: ${describeFailure(result.error)}`,
+        );
+      } catch {
+        /* a broken warning handler must not kill the scheduler */
+      }
+      // The backoff uses the same abortable wait as the cadence, so a stop
+      // during the delay ends the wait at once instead of idling until it
+      // expires.
+      await wait(delay, controller.signal);
+      if (stopped) return { ok: false, attempt, error: result.error };
+    }
+  }
+
   async function run(): Promise<void> {
     let deadline = now();
     while (!stopped) {
@@ -335,26 +705,30 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
 
       if (lateMs > maxSkewMs) missedBeats += 1;
 
-      try {
-        const result = (await submit({ at, lateMs })) ?? {};
-        if (stopped) break;
-        lastBeatAt = at;
-        lastBeatSecond = second;
+      const result = await submitBeat({ at, lateMs });
+      if (stopped) break;
+
+      if (!result.ok) {
         try {
-          options.onBeat?.(
-            result.ledger !== undefined ? { at, lateMs, ledger: result.ledger } : { at, lateMs },
-          );
-        } catch {
-          // The consumer's callback is theirs to get wrong; it must not stop the
-          // dead-man switch from being kept alive.
-        }
-      } catch (error) {
-        if (stopped) break;
-        try {
-          options.onError?.(error);
+          options.onError?.(result.error);
         } catch {
           /* ditto: a broken error handler must not kill the scheduler */
         }
+        continue;
+      }
+
+      lastBeatAt = at;
+      lastBeatSecond = second;
+      try {
+        options.onBeat?.({
+          at,
+          lateMs,
+          attempt: result.attempt,
+          ...(result.ledger !== undefined ? { ledger: result.ledger } : {}),
+        });
+      } catch {
+        // The consumer's callback is theirs to get wrong; it must not stop the
+        // dead-man switch from being kept alive.
       }
     }
   }

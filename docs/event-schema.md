@@ -65,7 +65,10 @@ behaves:
 | `GUARD_REASON_CODES` numbers | contract | **Append-only** | Numeric codes are never renumbered and never reused; removed variants keep their number. |
 | `describeGuardEvent()` text | SDK | **Internal** | A log line, not a format. Parse `GuardEvent`, not this string. |
 | `poll()` `cursor` / `latestLedger` | RPC | **Best-effort** | Pagination is host-defined; treat as opaque. |
-| `serializeEvent()` output | SDK | **Stable** | Canonical JSON line. Fixed key order and normalization policy — see below. |
+| `poll().unknownTopics` | SDK summary of contract topics | **Best-effort** | `{ topic: string; count: number }[]`, sorted by topic, for events the SDK did not recognise. No raw XDR or source payload. Additive (issue #287). |
+| `serializeEvent()` output | SDK | **Stable** | Canonical JSON line. Fixed key order and normalization policy — see below. Unversioned; legacy records are v0. |
+| `serializeEventRecord()` output | SDK | **Stable within `v: 1`** | Versioned envelope `{ "v": 1, "event": { … } }`. A new envelope version is a documented change; readers must branch on `v`, not assume the current one. |
+| `PollResult.dropped` | SDK | **Append-only** | Per-page rejection counts: `unknownTopic`, `foreignContract`, `missingContractId`, `malformedContractId`. New reasons may be added. |
 
 ### Canonical JSON serialization — `serializeEvent()`
 
@@ -121,6 +124,74 @@ modulo those normalizations — `bigint` becomes a decimal string, bytes become
 
 `serializeEvent()` is a format; `describeGuardEvent()` remains **Internal** (a
 log line, not a format), and the two are independent.
+
+### Versioned event records — `serializeEventRecord()` (issue #323)
+
+`serializeEvent()` is deliberately left byte-identical: its output is a
+**Stable** contract, so adding a version field in place would silently change
+what every existing JSON-lines consumer parses. Persisted records opt in to an
+explicitly versioned envelope instead:
+
+```ts
+import { serializeEventRecord, parseEventRecord } from "stellar-agent-guard-sdk";
+
+const line = serializeEventRecord(event);
+// {"v":1,"event":{"id":"ledger:…","kind":"auth_checked",…}}
+
+const { version, event } = parseEventRecord(line);
+// version === 1; `event` is the same projection serializeEvent() emits.
+```
+
+- **Envelope:** `{ "v": <positive integer>, "event": <canonical event> }`, `v`
+  first. `TELEMETRY_EVENT_RECORD_VERSION` is the current version (`1`).
+- **Bare `serializeEvent()` output is legacy v0.** It has no top-level `v` key,
+  so `parseEventRecord()` reports `version: 0` and returns the event unchanged.
+  Older records therefore remain identifiable without rewriting them.
+- **No silent break:** the `event` member is exactly the historical projection —
+  same key order, same drop-`undefined`/keep-`null` policy, same `bigint` and
+  byte normalization. A consumer can keep using its existing field parser on
+  `record.event`.
+- **JSON-safe:** the envelope is rendered through the same `toJsonSafe()` path
+  as `serializeEvent()`, so a heartbeat's `bigint` `data.at` is a decimal string
+  and `JSON.parse` reads the line back.
+- **Newer records are surfaced, not guessed at:** `parseEventRecord()` returns a
+  `v` newer than `TELEMETRY_EVENT_RECORD_VERSION` as-is so a caller can detect
+  and route it; it does not reinterpret it. Malformed envelopes throw.
+
+**Golden fixture:** `tests/fixtures/telemetry/event-record-v1.golden.json` pins
+one complete v1 record; `tests/unit/serialize-event.test.ts` asserts the writer
+matches it byte-for-byte. Bumping the envelope is a deliberate diff in that
+fixture plus a migration note — not an incidental change.
+
+**Migration note (v0 → v1):** no action is required for existing logs. A stored
+bare line parses as `version: 0`; a new v1 line carries `v: 1` and the same
+event fields under `event`. Readers that only understand bare records can keep
+reading historical data; to read new data they should switch to
+`parseEventRecord()` (or unwrap `event` after checking `v`).
+
+### Emitting-identity validation before decode (issue #322)
+
+`poll()` filters by contract at the RPC, but does **not** trust that filter. An
+event is decoded only when it reports an emitting contract and that contract
+canonicalises to the configured guard; otherwise it is dropped *before* the
+topic vocabulary is examined. This is what stops a faulty or proxying RPC from
+injecting another contract's guard-shaped topic into the guard's telemetry and
+having it reported as a decision.
+
+Handling is fail-closed and visible:
+
+| RPC `contractId` | Handling | `PollResult.dropped` bucket |
+| --- | --- | --- |
+| A contract address equal to the guard | Decode | — |
+| A contract address other than the guard | Drop | `foreignContract` |
+| Missing / `null` / empty | Drop (identity unverifiable) | `missingContractId` |
+| Present but not a contract address | Drop | `malformedContractId` |
+| Recognised identity, unknown name topic | Drop (normal rule 1 above) | `unknownTopic` |
+
+All four counters are zero on a fully attributable page, and the total is also
+logged (`dropped`, with the breakdown in `droppedByReason`). The diagnostic and
+failed-transaction streams already attributed only the configured guard's
+events (`emittedByGuard`); this closes the same gap on the committed stream.
 
 ## How it was captured
 
@@ -419,13 +490,46 @@ enum.
 
 ## Consequence for the telemetry listener
 
-The listener (Phase 2.4) filters on `event_auth_checked` and reads the decision
+The listener (Phase 2.4) re-checks the emitting contract id before decoding
+(see "Emitting-identity validation before decode") and then filters on
+`event_auth_checked` and reads the decision
 from topics, requiring no payload decoding. It must consume **both** streams:
 committed ledger events for allowed decisions and administrative actions, and
 enforced-simulation diagnostic events for blocked ones — because a refusal is
 never committed, and a listener that only tails the ledger would see a guard that
 appears to never block anything. `watchAll()` (see "Merged stream" below)
 delivers exactly that union as one ordered iterator.
+
+## Unknown event topics — observability without payloads
+
+Unknown name topics are still **dropped, not guessed**: they never become a
+`GuardEvent`, never enter the listener's buffer, and do not change delivery. But
+silence should not be indistinguishable from a contract vocabulary change, and a
+host may not have configured a logger to read the debug count. The listener
+therefore exposes the decoded names and per-page counts as optional observability:
+
+```ts
+const page = await listener.poll({ startLedger });
+for (const { topic, count } of page.unknownTopics) {
+  alerting.unknownTopic(topic, count);
+}
+
+for await (const events of listener.watch({
+  onUnknownTopics(unknownTopics) {
+    // Called once per page that contains at least one unknown topic.
+    for (const { topic, count } of unknownTopics) alerting.unknownTopic(topic, count);
+  },
+})) {
+  // Known events only, exactly as before.
+}
+```
+
+`unknownTopics` is sorted by topic and is empty when every event decoded. The
+callback receives the same shape and is isolated: a throwing observability sink
+cannot stop the stream, matching `onGap`. The summary contains only the decoded
+name topic and its count — never the source event, its XDR, transaction hash, or
+payload. This is additive; the default polling path and `GuardEvent` shape are
+unchanged.
 
 ## Event identity — `GuardEvent.id`
 
@@ -515,14 +619,20 @@ fields, and nothing else about it moves).
 ### Ordering rule
 
 - **Committed events are emitted in ledger order.** A page is sorted by `ledger`
-  ascending before it is yielded, and pages arrive in cursor order, so no
-  committed event overtakes an earlier-ledger one.
+  ascending before it is yielded (a missing ledger sorts last), and pages arrive
+  in cursor order, so no committed event overtakes an earlier-ledger one.
+- **Events on the same ledger use a stable tie-breaker.** They sort by
+  transaction hash, then topic, then stable `id`, each ascending with a missing
+  value last. Two entries that are still indistinguishable keep their input
+  order. The same comparator is applied by `poll()`, `watch()` and `watchAll()`,
+  so switching APIs cannot change committed-event order.
 - **Diagnostic events are emitted when the batch carrying them is observed**,
   tagged with `observedAt` (ISO-8601; defaults to the merge time). A refusal has
   no ledger — it was rolled back before broadcast — so it is positioned at its
   point of observation relative to the committed events already drained, not by a
   ledger. A decision observed at time T appears after the committed events
-  drained at or before T.
+  drained at or before T. Diagnostic batches are never re-sorted; their
+  observation order is preserved exactly as supplied.
 
 ### De-duplication rule
 

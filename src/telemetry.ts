@@ -32,7 +32,7 @@
  * `docs/event-schema.md` and implemented by `guardEventId` below.
  */
 import { rpc, scValToNative, StrKey, xdr } from "@stellar/stellar-sdk";
-import { bytesToHex, sha256Hex, utf8Length } from "./hash.ts";
+import { GuardError } from "./errors.ts";
 import { GUARD_AUTH_RESULTS, GUARD_EVENT_TOPICS, decodeAuthDecision, normalizeEventData, type GuardAuthDecision } from "./events.ts";
 import { topicSymbols } from "./invoke.ts";
 import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
@@ -129,6 +129,11 @@ export interface GuardEvent {
    * ring buffer is enabled, for as long as that buffer retains the event. That is
    * why it is opt-in and off by default; turn it on for the debugging session or
    * the bug-report window, not for a long-running fleet.
+   *
+   * A snapshot handed out by `recent()` carries a **copy** of this payload
+   * (issue #344), so editing the copy cannot corrupt the retained record. The
+   * copy keeps the XDR values' prototypes, so `raw` still behaves like the
+   * object the SDK actually saw.
    */
   raw?: unknown;
 }
@@ -431,6 +436,26 @@ function dataOf(raw: unknown): unknown {
   return body?.v0?.data ?? body?.value?.v0?.data;
 }
 
+/**
+ * Canonicalise a contract address supplied by the RPC, or return null when it is
+ * absent/malformed.
+ *
+ * Identity is compared in canonical `C...` form rather than as an opaque
+ * string: an RPC that upper/lower-cases or pads the field must not be able to
+ * slip a foreign event past the check, and a value that is not a contract
+ * strkey at all is not something this SDK can attribute to a guard (#322).
+ */
+function canonicalContractId(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return null;
+  try {
+    return StrKey.encodeContract(StrKey.decodeContract(trimmed));
+  } catch {
+    return null;
+  }
+}
+
 /** True only when the diagnostic's emitting contract is this guard. */
 function emittedByGuard(raw: unknown, guard: string): boolean {
   const bare = (raw as { event?: unknown }).event ?? raw;
@@ -493,6 +518,99 @@ function matchesRecentFilter(event: GuardEvent, filter: RecentEventFilter): bool
 }
 
 /**
+ * Deep-copy one value so a snapshot cannot be mutated through the copy
+ * (issue #344).
+ *
+ * The copy is *structural*, not a re-serialisation:
+ *
+ * - objects and arrays are rebuilt, so a nested field cannot be reached
+ *   through the copy and written back into the retained event;
+ * - byte arrays are copied, so a byte written into the copy does not land in
+ *   the source buffer;
+ * - a class instance keeps its prototype, so an XDR value inside an opt-in
+ *   `raw` payload still answers `value`/`toXdr()` like the value it was;
+ * - cycles are handled through `seen`, because a `raw` payload is
+ *   host-supplied and this function must not hang on a self-referential one.
+ *
+ * Primitives (including `bigint`) are returned as they are: there is nothing
+ * to detach, and the decoded data of most events is exactly that.
+ */
+function detachValue<T>(value: T, seen: WeakMap<object, unknown>): T {
+  if (value === null || typeof value !== "object") return value;
+  const source = value as unknown as object;
+  const existing = seen.get(source);
+  if (existing !== undefined) return existing as T;
+
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(source, copy);
+    for (const item of value) copy.push(detachValue(item, seen));
+    return copy as unknown as T;
+  }
+  if (value instanceof Date) {
+    const copy = new Date(value.getTime());
+    seen.set(source, copy);
+    return copy as unknown as T;
+  }
+  if (value instanceof Uint8Array) {
+    // `new Uint8Array(view)` copies the bytes; it does not alias the source.
+    const copy = new Uint8Array(value);
+    seen.set(source, copy);
+    return copy as unknown as T;
+  }
+  if (value instanceof ArrayBuffer) {
+    const copy = value.slice(0);
+    seen.set(source, copy);
+    return copy as unknown as T;
+  }
+  if (value instanceof Map) {
+    const copy = new Map<unknown, unknown>();
+    seen.set(source, copy);
+    for (const [key, item] of value) {
+      copy.set(detachValue(key, seen), detachValue(item, seen));
+    }
+    return copy as unknown as T;
+  }
+  if (value instanceof Set) {
+    const copy = new Set<unknown>();
+    seen.set(source, copy);
+    for (const item of value) copy.add(detachValue(item, seen));
+    return copy as unknown as T;
+  }
+  // A plain object or a class instance: rebuild it with the same prototype, so
+  // an XDR value keeps its methods instead of degrading into a bare object.
+  const copy = Object.create(Object.getPrototypeOf(value)) as Record<string, unknown>;
+  seen.set(source, copy);
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    copy[key] = detachValue(item, seen);
+  }
+  return copy as unknown as T;
+}
+
+/**
+ * A detached snapshot of one event (issue #344).
+ *
+ * The event object, its decoded `decision`, its decoded `data` and the opt-in
+ * `raw` payload are all copied, so a consumer that mutates what `recent()`
+ * handed it cannot reach the event the buffer still retains.
+ *
+ * `seen` is shared by every event of one snapshot, so a value two events point
+ * at stays one value in the snapshot too — the copy mirrors the retained
+ * structure instead of quietly splitting it.
+ */
+function detachEvent(event: GuardEvent, seen: WeakMap<object, unknown>): GuardEvent {
+  const copy: GuardEvent = {
+    ...event,
+    decision: event.decision === null ? null : detachValue(event.decision, seen),
+    data: detachValue(event.data, seen),
+  };
+  // `raw` is absent — not `null` — unless the decode asked for it, and that
+  // distinction is part of the documented contract.
+  if (event.raw !== undefined) copy.raw = detachValue(event.raw, seen);
+  return copy;
+}
+
+/**
  * A fixed-capacity FIFO ring of the most recent `GuardEvent`s (issue #68).
  *
  * O(1) push with no allocation after construction: the backing array is
@@ -537,13 +655,23 @@ export class GuardEventRingBuffer {
   /**
    * The retained events in observation order, optionally narrowed by `filter`.
    *
-   * Returns a copy, so a caller cannot mutate the ring by holding the result.
+   * Returns **detached snapshots** (issue #344): a fresh array, and a fresh
+   * copy of every event in it — including the nested decoded `data`, the
+   * decoded `decision`, and the opt-in `raw` payload. Mutating what this
+   * returns can therefore never change what the ring still retains, and a
+   * later `recent()` reports the retained event, not the consumer's edit.
+   *
+   * The copy is per call, not per event: the ring itself keeps the original
+   * event objects, so the cost is paid only by a caller that actually reads a
+   * snapshot — and a listener with no buffer configured never allocates one at
+   * all.
    */
   recent(filter?: RecentEventFilter): GuardEvent[] {
     const out: GuardEvent[] = [];
+    const seen = new WeakMap<object, unknown>();
     for (let i = 0; i < this.count; i += 1) {
       const event = this.slots[(this.start + i) % this.max]!;
-      if (!filter || matchesRecentFilter(event, filter)) out.push(event);
+      if (!filter || matchesRecentFilter(event, filter)) out.push(detachEvent(event, seen));
     }
     return out;
   }
@@ -601,11 +729,49 @@ export interface GuardTelemetryConfig {
   cursorStore?: CursorStore;
 }
 
+/**
+ * Per-page count of events the listener refused to decode (#322).
+ *
+ * Identity is checked *before* decoding: an event is only interpreted when the
+ * RPC reports an emitting contract and that contract is the configured guard.
+ * A page from a faulty or proxying RPC therefore cannot inject another
+ * contract's guard-shaped topic into this guard's telemetry. The split exists
+ * so "the guard was quiet" is distinguishable from each rejection reason.
+ */
+export interface GuardEventDropCounts {
+  /** Events whose name topic this SDK version does not know. */
+  unknownTopic: number;
+  /** Events emitted by a contract other than the configured guard. */
+  foreignContract: number;
+  /** Events whose `contractId` the RPC omitted — identity cannot be verified. */
+  missingContractId: number;
+  /** Events whose `contractId` was present but is not a contract address. */
+  malformedContractId: number;
+}
+
+/**
+ * One name topic on a committed page that this SDK version does not recognise.
+ *
+ * Only the decoded topic text and its count are exposed. The source event, its
+ * raw XDR, and its payload are deliberately not retained or reported.
+ */
+export interface GuardUnknownTopic {
+  /** The event's name topic as decoded text; empty when the event carried none. */
+  topic: string;
+  /** How many events on this page carried that name topic. */
+  count: number;
+}
+
 export interface PollResult {
   events: GuardEvent[];
   /** Cursor to resume from, as returned by the RPC. */
   cursor: string;
   latestLedger: number;
+  /**
+   * Why this page's events were dropped, by reason (#322). All four counts are
+   * zero on a page where every event was attributable to the guard.
+   */
+  dropped: GuardEventDropCounts;
   /**
    * Oldest ledger the RPC still retains, from the same response
    * (`Api.RetentionState.oldestLedger`).
@@ -614,6 +780,14 @@ export interface PollResult {
    * case rather than guessed at: a proof needs the boundary.
    */
   oldestLedger: number | null;
+  /**
+   * Unknown name topics on this page, sorted by topic, with per-page counts.
+   *
+   * Empty when every event decoded. These events stay out of `events` and are
+   * never added to the listener's buffer; this summary contains no raw XDR or
+   * event payload. Additive (issue #287).
+   */
+  unknownTopics: GuardUnknownTopic[];
 }
 
 /**
@@ -807,6 +981,16 @@ export interface GuardTelemetryWatchParams {
    */
   onGap?: (gap: GuardTelemetryGap) => void;
   /**
+   * Called once for each successful page that contains at least one event whose
+   * name topic this SDK version does not recognise.
+   *
+   * The callback receives decoded topic names and per-page counts only — never
+   * raw XDR or the source event payload. A throwing callback is isolated so an
+   * observability sink cannot stop the stream. `poll()` exposes the same
+   * summary as `PollResult.unknownTopics`. Additive (issue #287).
+   */
+  onUnknownTopics?: (unknownTopics: readonly GuardUnknownTopic[]) => void;
+  /**
    * Called once when the committed stream ends because of a terminal RPC
    * failure — after the bounded retry envelope is exhausted. Fail-visible
    * telemetry: a silent stream death is an incident blind spot.
@@ -855,7 +1039,14 @@ export interface GuardTelemetryStats {
   blocked: number;
   /** Blocked decisions in the window, keyed by reason. */
   byReason: Record<string, number>;
-  /** Timestamp (per the injected clock) of the oldest decision in the window. */
+  /**
+   * Timestamp of the oldest decision in the window, on the counter's monotonic
+   * timeline (#320). It is the observation time clamped to never move backwards:
+   * after a wall-clock rollback it holds the previous high-water mark rather
+   * than a value in the past, and when the window is empty it is the current
+   * monotonic time. It is **not** a wall-clock reading to compare with
+   * `Date.now()`; treat it as the start of the retained interval.
+   */
   windowStart: number;
 }
 
@@ -880,6 +1071,17 @@ export class GuardDecisionCounters {
   private allowed = 0;
   private blocked = 0;
   private readonly byReason = new Map<string, number>();
+  /**
+   * High-water mark of the injected clock (#320).
+   *
+   * Eviction runs on a **monotonic** timeline: every observation is clamped to
+   * `Math.max(now, lastObservedAt)`. A wall-clock rollback (NTP correction, a
+   * container moved between hosts, a date set backwards) therefore cannot push
+   * the eviction cutoff backwards and leave entries retained past the
+   * advertised window. Forward jumps are honoured immediately, so a clock that
+   * leaps ahead still expires stale entries. `null` until the first observation.
+   */
+  private lastObservedAt: number | null = null;
 
   constructor(options: GuardTelemetryCountersOptions) {
     const { windowEvents, windowMs } = options;
@@ -905,7 +1107,7 @@ export class GuardDecisionCounters {
     if (event.kind !== "auth_checked" || event.decision === null) return;
     const verdict = isAllowedDecision(event.decision) ? "allowed" : "blocked";
     const reason = event.decision.reason ?? null;
-    const at = this.clock();
+    const at = this.monotonicNow();
     this.entries.push({ verdict, reason, at });
     if (verdict === "allowed") this.allowed += 1;
     else {
@@ -913,6 +1115,22 @@ export class GuardDecisionCounters {
       if (reason !== null) this.byReason.set(reason, (this.byReason.get(reason) ?? 0) + 1);
     }
     this.evict();
+  }
+
+  /**
+   * Current time on the counter's monotonic timeline.
+   *
+   * The first observation establishes the epoch. From then on the clock may
+   * only move forward: a backward step reads as the high-water mark, and a
+   * forward step advances it. `stats()` may be the first caller, which is fine
+   * — with no entries there is nothing to retain.
+   */
+  private monotonicNow(): number {
+    const observed = this.clock();
+    if (this.lastObservedAt === null || observed > this.lastObservedAt) {
+      this.lastObservedAt = observed;
+    }
+    return this.lastObservedAt;
   }
 
   /** Drop entries that have aged out of the window. */
@@ -923,7 +1141,7 @@ export class GuardDecisionCounters {
       }
       return;
     }
-    const cutoff = this.clock() - (this.windowMs ?? 0);
+    const cutoff = this.monotonicNow() - (this.windowMs ?? 0);
     while (this.entries.length > 0 && this.entries[0]!.at < cutoff) {
       this.remove(this.entries.shift()!);
     }
@@ -949,7 +1167,7 @@ export class GuardDecisionCounters {
       allowed: this.allowed,
       blocked: this.blocked,
       byReason: Object.fromEntries(this.byReason),
-      windowStart: this.entries.length > 0 ? this.entries[0]!.at : this.clock(),
+      windowStart: this.entries.length > 0 ? this.entries[0]!.at : this.monotonicNow(),
     };
   }
 }
@@ -982,9 +1200,52 @@ export interface GuardTelemetryUnifiedParams extends GuardTelemetryWatchParams {
   diagnostics?: AsyncIterable<GuardDiagnosticBatch> | Iterable<GuardDiagnosticBatch>;
 }
 
-/** Committed events sort by ledger ascending; a missing ledger sorts last. */
-function compareEventsByLedger(a: GuardEvent, b: GuardEvent): number {
-  return (a.ledger ?? Number.MAX_SAFE_INTEGER) - (b.ledger ?? Number.MAX_SAFE_INTEGER);
+/** Plain code-unit string comparison, independent of the host locale. */
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Ascending string order, with a missing value sorting last. */
+function compareNullableStrings(a: string | null, b: string | null): number {
+  if (a === b) return 0;
+  if (a === null) return 1;
+  if (b === null) return -1;
+  return compareStrings(a, b);
+}
+
+/** Render one page's unknown-topic counts in a stable, payload-free shape. */
+function unknownTopicSummary(counts: ReadonlyMap<string, number>): GuardUnknownTopic[] {
+  return [...counts.entries()]
+    .map(([topic, count]) => ({ topic, count }))
+    .sort((a, b) => compareStrings(a.topic, b.topic));
+}
+
+/**
+ * The committed-page ordering rule: ledger ascending, then a stable
+ * tie-breaker for events that share a ledger.
+ *
+ * A missing ledger sorts last. Within one ledger the tie-breaker is the
+ * transaction hash, then the event topic, then the stable event id, each
+ * ascending and each placing a missing value last. The final id component
+ * makes the comparison total for every event this SDK produces; when two
+ * entries are indistinguishable the caller's input order is preserved by the
+ * stable `Array#sort`. `poll()`, `watch()` and `watchAll()` all apply this same
+ * rule, so switching APIs cannot change committed-event order.
+ */
+export function compareCommittedEvents(a: GuardEvent, b: GuardEvent): number {
+  const ledgerA = a.ledger ?? Number.MAX_SAFE_INTEGER;
+  const ledgerB = b.ledger ?? Number.MAX_SAFE_INTEGER;
+  if (ledgerA !== ledgerB) return ledgerA - ledgerB;
+  const byHash = compareNullableStrings(a.transactionHash, b.transactionHash);
+  if (byHash !== 0) return byHash;
+  const byTopic = compareStrings(a.topic, b.topic);
+  if (byTopic !== 0) return byTopic;
+  return compareStrings(a.id, b.id);
+}
+
+/** Sort one committed page in place, leaving every other stream untouched. */
+function sortCommittedPage(events: GuardEvent[]): GuardEvent[] {
+  return events.sort(compareCommittedEvents);
 }
 
 /** Adapt a sync or async iterable to an async iterator, so both arms can be armed. */
@@ -1015,9 +1276,11 @@ type MergePull =
  *
  * ## Ordering rule
  *
- * - **Committed events are emitted in ledger order.** Each page is sorted by
- *   `ledger` ascending before it is yielded, and pages arrive in cursor order,
- *   so no committed event overtakes an earlier-ledger one.
+ * - **Committed events are emitted in ledger order.** Each page is sorted with
+ *   `compareCommittedEvents()` before it is yielded: `ledger` ascending (missing
+ *   last), then transaction hash, topic and stable id as tie-breakers for events
+ *   that share a ledger. Pages arrive in cursor order, so no committed event
+ *   overtakes an earlier-ledger one.
  * - **Diagnostic events are emitted when the batch carrying them is observed**,
  *   tagged with `observedAt`. A refusal was rolled back before broadcast, so it
  *   has no ledger to sort on; its position is the point of observation relative
@@ -1073,10 +1336,17 @@ export async function* mergeGuardEventStreams(
       if (settled.source === "committed") {
         committedPull = null;
         if (settled.result.done) continue;
-        for (const event of [...settled.result.value].sort(compareEventsByLedger)) {
-          if (emitted.has(event.id)) continue;
-          emitted.add(event.id);
-          yield event;
+        const page = settled.result.value;
+        const orderedCommitted = sortCommittedPage(
+          page.filter((event) => event.stream === "committed"),
+        );
+        let nextCommitted = 0;
+        for (const event of page) {
+          const ordered =
+            event.stream === "committed" ? orderedCommitted[nextCommitted++]! : event;
+          if (emitted.has(ordered.id)) continue;
+          emitted.add(ordered.id);
+          yield ordered;
         }
         committedPull = committed
           .next()
@@ -1132,9 +1402,38 @@ export interface GuardTelemetryLocalConfig {
   logger?: GuardLoggerInput | undefined;
 }
 
+/**
+ * Thrown when a second `watch()`/`watchAll()` stream is started on a listener
+ * that already has one active.
+ *
+ * A listener owns shared cursor, failed-transaction de-duplication, counter,
+ * and buffer state. Rather than let two iterators race those structures, the
+ * listener supports **one active stream at a time**: a second stream is
+ * rejected before it issues an RPC request or advances any cursor. Start a
+ * second listener (with its own options) when you need independent streams.
+ */
+export class ConcurrentTelemetryStreamError extends GuardError {
+  /** Stable code for consumers that branch on the failure. */
+  readonly code = "telemetry.concurrent_stream";
+  /** The stream kind that was rejected. */
+  readonly requested: "watch" | "watchAll";
+
+  constructor(requested: "watch" | "watchAll") {
+    super(
+      `GuardTelemetryListener already has an active watch()/watchAll() stream; ${requested}() cannot start concurrently. Use one listener per stream.`,
+    );
+    this.requested = requested;
+  }
+}
+
 export class GuardTelemetryListener {
   private readonly config: GuardTelemetryConfig;
   private readonly logger: GuardLogger;
+  /** The configured guard in canonical `C...` form, for identity comparison. */
+  private readonly guardContractId: string;
+
+  /** Lease for the one stream currently allowed to mutate listener state. */
+  private activeStreamLease: symbol | null = null;
 
   /** The persistence adapter this listener is using (defaults to in-memory). */
   readonly activeCursorStore: CursorStore;
@@ -1179,6 +1478,7 @@ export class GuardTelemetryListener {
   constructor(config: GuardTelemetryConfig | GuardTelemetryLocalConfig = {}) {
     const resolved = config as GuardTelemetryConfig;
     this.config = resolved;
+    this.guardContractId = canonicalContractId(resolved.guard) ?? resolved.guard ?? "";
     this.logger = resolveLogger(resolved.logger);
     this.buffer = resolved.buffer ? new GuardEventRingBuffer(resolved.buffer.max) : null;
     this.activeCursorStore = resolved.cursorStore ?? new InMemoryCursorStore();
@@ -1219,6 +1519,13 @@ export class GuardTelemetryListener {
    * two-stream distinction the rest of the telemetry API makes.
    *
    * The buffer is in-process and non-durable; a restart empties it.
+   *
+   * **Snapshot semantics (issue #344):** what this returns is a *detached
+   * snapshot*. The array, the events in it, their decoded `data`/`decision` and
+   * the opt-in `raw` payload are all copies, so mutating them cannot change
+   * what the listener still retains, and the next `recent()` reports the
+   * retained event rather than the consumer's edit. With no buffer configured
+   * there is nothing to copy: the call returns `[]` and allocates nothing.
    */
   recent(filter?: RecentEventFilter): GuardEvent[] {
     return this.buffer ? this.buffer.recent(filter) : [];
@@ -1320,8 +1627,14 @@ export class GuardTelemetryListener {
   /**
    * One page of committed guard events at or after `startLedger`.
    *
-   * Filters server-side by contract id, so the listener only ever sees this
-   * guard's own events — the topic vocabulary then narrows further, and an
+   * Filters server-side by contract id, but does not trust that filter: the
+   * emitting contract is re-checked client-side before any event is decoded
+   * (#322). A faulty or proxying RPC that returns a foreign contract's
+   * guard-shaped topic is dropped, never reported as this guard's decision.
+   * Events with a missing or malformed `contractId` fail closed for the same
+   * reason — their identity cannot be verified. Rejections are counted per
+   * reason in `PollResult.dropped` and logged, so the drop is visible rather
+   * than silent. The topic vocabulary then narrows further, and an
    * unrecognised topic is dropped rather than guessed at.
    */
   async poll(params: { startLedger?: number; cursor?: string; limit?: number } = {}): Promise<PollResult> {
@@ -1345,14 +1658,37 @@ export class GuardTelemetryListener {
     const response = await this.config.server.getEvents(request);
     const events: GuardEvent[] = [];
     // Kept rather than merely skipped: an event this listener cannot interpret
-    // is a coverage fact a host may need to see, and counting it is the only
-    // way to tell "the guard was quiet" from "the guard spoke in a vocabulary
-    // this SDK version does not know".
-    let dropped = 0;
+    // is a coverage fact a host may need to see. Counting it is the only way to
+    // tell "the guard was quiet" from "the guard spoke in a vocabulary this SDK
+    // version does not know", and the per-topic summary below is page metadata
+    // a logger-less host can read without retaining the source payload (#287).
+    const dropped: GuardEventDropCounts = {
+      unknownTopic: 0,
+      foreignContract: 0,
+      missingContractId: 0,
+      malformedContractId: 0,
+    };
+    const unknownTopicCounts = new Map<string, number>();
     for (const event of response.events) {
-      const contractId = event.contractId ? String(event.contractId) : null;
+      const rawContractId = (event as { contractId?: unknown }).contractId;
+      if (rawContractId === undefined || rawContractId === null || rawContractId === "") {
+        // Fail closed: without an emitting identity the event cannot be shown to
+        // belong to this guard, and the server-side filter is what is in doubt.
+        dropped.missingContractId += 1;
+        continue;
+      }
+      const contractId = canonicalContractId(rawContractId);
+      if (contractId === null) {
+        dropped.malformedContractId += 1;
+        continue;
+      }
+      if (contractId !== this.guardContractId) {
+        dropped.foreignContract += 1;
+        continue;
+      }
+      const topics = event.topic.map((topic) => String(scValToNative(topic)));
       const decoded = interpret(
-        event.topic.map((topic) => String(scValToNative(topic))),
+        topics,
         decodeData(event.value),
         {
           source: "ledger",
@@ -1369,14 +1705,28 @@ export class GuardTelemetryListener {
           ...(this.config.includeRaw ? { raw: event } : {}),
         },
       );
-      if (decoded) events.push(decoded);
-      else dropped += 1;
+      if (decoded) {
+        events.push(decoded);
+      } else {
+        dropped.unknownTopic += 1;
+        const topic = topics[0] ?? "";
+        unknownTopicCounts.set(topic, (unknownTopicCounts.get(topic) ?? 0) + 1);
+      }
     }
+    sortCommittedPage(events);
+    const unknownTopics = unknownTopicSummary(unknownTopicCounts);
     const oldestLedger = typeof response.oldestLedger === "number" ? response.oldestLedger : null;
+    const droppedTotal =
+      dropped.unknownTopic +
+      dropped.foreignContract +
+      dropped.missingContractId +
+      dropped.malformedContractId;
     this.logger.debug("telemetry page received", {
       guard: this.config.guard,
       events: events.length,
-      dropped,
+      dropped: droppedTotal,
+      droppedByReason: dropped,
+      unknownTopics,
       latestLedger: response.latestLedger,
       oldestLedger,
     });
@@ -1385,10 +1735,27 @@ export class GuardTelemetryListener {
       events,
       cursor: response.cursor,
       latestLedger: response.latestLedger,
+      dropped,
       // Best-effort: a host that omits the retention boundary gets no gap
       // detection, rather than a boundary invented from `latestLedger`.
       oldestLedger,
+      unknownTopics,
     };
+  }
+
+  /** Claim the single active-stream lease, or reject concurrent use. */
+  private acquireStreamLease(kind: "watch" | "watchAll"): symbol {
+    if (this.activeStreamLease !== null) {
+      throw new ConcurrentTelemetryStreamError(kind);
+    }
+    const lease = Symbol(kind);
+    this.activeStreamLease = lease;
+    return lease;
+  }
+
+  /** Release the lease only if it is still the one this stream holds. */
+  private releaseStreamLease(lease: symbol): void {
+    if (this.activeStreamLease === lease) this.activeStreamLease = null;
   }
 
   /**
@@ -1400,6 +1767,8 @@ export class GuardTelemetryListener {
    * When `onGap` is supplied, the listener also checks each response's retention
    * window and reports a provable hole (see `GuardTelemetryGap`) instead of
    * silently skipping it. Omitting `onGap` changes nothing about the stream.
+   * `onUnknownTopics` reports unrecognised name topics by count without retaining
+   * their payloads; omitting it leaves delivery unchanged.
    *
    * ## Aborting
    *
@@ -1411,8 +1780,28 @@ export class GuardTelemetryListener {
    * one bound on promptness is the request already in flight: `getEvents` takes
    * no `AbortSignal` (see the README's cancellation note), so the listener can
    * stop *issuing* requests immediately but cannot cancel one already sent.
+   *
+   * ## Concurrency
+   *
+   * One listener supports one active stream. Starting a second `watch()` or
+   * `watchAll()` while the first is still being pulled throws
+   * `ConcurrentTelemetryStreamError`; it never issues an RPC request, saves a
+   * cursor, or records an event. Use a separate listener for an independent
+   * stream.
    */
   async *watch(
+    params: GuardTelemetryWatchParams = {},
+  ): AsyncGenerator<GuardEvent[], void, undefined> {
+    const lease = this.acquireStreamLease("watch");
+    try {
+      yield* this.watchStream(params);
+    } finally {
+      this.releaseStreamLease(lease);
+    }
+  }
+
+  /** The implementation behind `watch()`, also used by `watchAll()`. */
+  private async *watchStream(
     params: GuardTelemetryWatchParams = {},
   ): AsyncGenerator<GuardEvent[], void, undefined> {
     const interval = params.pollIntervalMs ?? 5_000;
@@ -1561,6 +1950,15 @@ export class GuardTelemetryListener {
         }
       }
 
+      if (params.onUnknownTopics && page.unknownTopics.length > 0) {
+        try {
+          params.onUnknownTopics(page.unknownTopics);
+        } catch {
+          // Observability must not be able to stop telemetry: the same isolation
+          // contract as `onGap`.
+        }
+      }
+
       const events = [...page.events, ...failedTxEvents];
 
       await this.activeCursorStore.save(page.cursor);
@@ -1608,18 +2006,23 @@ export class GuardTelemetryListener {
   async *watchAll(
     params: GuardTelemetryUnifiedParams = {},
   ): AsyncGenerator<GuardEvent, void, undefined> {
-    if (params.signal?.aborted) return;
-    for await (const event of mergeGuardEventStreams(
-      this.watch(params),
-      params.diagnostics,
-      params.signal,
-    )) {
-      this.counters?.record(event);
-      // Committed events were already recorded when their page was decoded in
-      // `poll()`, so only the diagnostic half is recorded here — recording the
-      // merged stream wholesale would double every committed event.
-      if (event.stream === "diagnostic") this.record([event]);
-      yield event;
+    const lease = this.acquireStreamLease("watchAll");
+    try {
+      if (params.signal?.aborted) return;
+      for await (const event of mergeGuardEventStreams(
+        this.watchStream(params),
+        params.diagnostics,
+        params.signal,
+      )) {
+        this.counters?.record(event);
+        // Committed events were already recorded when their page was decoded in
+        // `poll()`, so only the diagnostic half is recorded here — recording the
+        // merged stream wholesale would double every committed event.
+        if (event.stream === "diagnostic") this.record([event]);
+        yield event;
+      }
+    } finally {
+      this.releaseStreamLease(lease);
     }
   }
 }
@@ -1744,6 +2147,11 @@ function toJsonSafe(value: unknown): unknown {
  * `docs/event-schema.md` under "Canonical JSON serialization".
  */
 export function serializeEvent(event: GuardEvent): string {
+  return JSON.stringify(toJsonSafe(projectEvent(event)));
+}
+
+/** The bare, unversioned projection `serializeEvent()` has always emitted. */
+function projectEvent(event: GuardEvent): Record<string, unknown> {
   const projected: Record<string, unknown> = {};
   for (const key of EVENT_KEY_ORDER) {
     const value = event[key];
@@ -1759,7 +2167,93 @@ export function serializeEvent(event: GuardEvent): string {
     }
     projected.decision = decision;
   }
-  return JSON.stringify(toJsonSafe(projected));
+  return projected;
+}
+
+/**
+ * Current version of the serialized event-record envelope (#323).
+ *
+ * `serializeEvent()` remains the unversioned v0 format it has always been: its
+ * output is a documented **Stable** contract, so changing it in place would
+ * silently break every consumer of stored JSON-lines. Persisted records instead
+ * opt in to `serializeEventRecord()`, whose envelope carries this version
+ * explicitly. A legacy line is identifiable by the absence of `v` (v0).
+ */
+export const TELEMETRY_EVENT_RECORD_VERSION = 1;
+
+/**
+ * One versioned, JSON-safe telemetry record: `{ "v": 1, "event": { ... } }`.
+ *
+ * The envelope keeps the event projection byte-identical to `serializeEvent()`'s
+ * output — only the version wrapper is new — so a v1 reader can hand `event` to
+ * any existing consumer, and a v0 reader that ignores unknown top-level keys can
+ * still find the event fields. See `docs/event-schema.md` for the migration
+ * note and `tests/fixtures/telemetry/event-record-v1.golden.json` for the golden
+ * fixture.
+ */
+export interface GuardEventRecord {
+  /** Envelope schema version; `TELEMETRY_EVENT_RECORD_VERSION` at write time. */
+  v: number;
+  /** The canonical event projection, identical to `serializeEvent()`'s object. */
+  event: Record<string, unknown>;
+}
+
+/**
+ * Serialize one event inside a versioned envelope, for persisted JSON-lines.
+ *
+ * Rendering rules are exactly `serializeEvent()`'s (fixed key order, drop
+ * `undefined`, keep `null`, `bigint` → decimal string, bytes → `bytes:<hex>`),
+ * so the value is JSON-safe and deterministic. The envelope adds `v` as the
+ * first key; `event` follows with the historical field order.
+ */
+export function serializeEventRecord(event: GuardEvent): string {
+  const record: GuardEventRecord = {
+    v: TELEMETRY_EVENT_RECORD_VERSION,
+    event: projectEvent(event),
+  };
+  return JSON.stringify(toJsonSafe(record));
+}
+
+/** The result of reading one stored telemetry line. */
+export interface ParsedGuardEventRecord {
+  /**
+   * `0` for a legacy bare event line written before the envelope existed,
+   * otherwise the envelope's `v`. A version greater than
+   * `TELEMETRY_EVENT_RECORD_VERSION` is returned as-is so a caller can detect a
+   * record written by a newer SDK rather than silently mis-order its fields.
+   */
+  version: number;
+  /** The event projection, unmodified. */
+  event: Record<string, unknown>;
+}
+
+/**
+ * Read one stored telemetry line, versioned or legacy (#323).
+ *
+ * Older records remain identifiable: a bare event line (no `v` key) is
+ * reported as `version: 0`, while an envelope reports its own version. The
+ * parser is deliberately shallow — it identifies the format, it does not
+ * validate every event field — so an unknown-but-newer record is still
+ * inspectable. Malformed input throws `TypeError` rather than being guessed at.
+ */
+export function parseEventRecord(line: string): ParsedGuardEventRecord {
+  const parsed: unknown = JSON.parse(line);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new TypeError("telemetry record must be a JSON object");
+  }
+  const record = parsed as Record<string, unknown>;
+  if (!("v" in record)) {
+    return { version: 0, event: record };
+  }
+  const version = record.v;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    throw new TypeError("telemetry record `v` must be a positive integer");
+  }
+  const event = record.event;
+  if (event === null || typeof event !== "object" || Array.isArray(event)) {
+    throw new TypeError("telemetry record `event` must be a JSON object");
+  }
+  return { version, event: event as Record<string, unknown> };
 }
 
 /** A compact one-line rendering of a guard event, for logs. */
