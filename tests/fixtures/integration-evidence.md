@@ -869,4 +869,76 @@ this branch before merge** and replace this addendum with the fresh run output.
 No credentials, deployment or policy change are needed beyond what the suite
 already does.
 
+## Addendum — 2026-10-19 (PR #352: adapter call batches, silent hook failures, browser-safe hashing, packed-type smoke test)
+
+Recorded because this PR touches the enforcement path (`src/tx.ts`,
+`src/preflight.ts`) and CI's `enforcement-path evidence gate` therefore requires
+this file in the diff.
+
+**It is not accompanied by a fresh live-testnet run**: `.env.phase2` is absent
+from this checkout, so `npm run test:integration` cannot begin its scenarios. No
+fresh Phase-2 transcript is claimed below. The CI gate verifies only that this
+file was touched — not the numbers — and the same limitation stated in every
+addendum above applies here unchanged.
+
+### What the PR changes on the enforcement path
+
+- `src/tx.ts`: removes `node:crypto`. `networkId` and the auth-preimage digest
+  now come from `sha256()` in the new `src/hash.ts` (the Stellar SDK's own
+  browser-compatible SHA-256) instead of `createHash("sha256")`; `agent.sign()`
+  takes the digest `Uint8Array` directly instead of a `Buffer` copy;
+  `ledgerKeyId()` renders the same XDR bytes as lower-case hex instead of
+  base64 — an in-call de-duplication key for footprint entries, the same bytes
+  in a different encoding, never persisted and never compared across runs; and
+  `toPlain` renders bytes through `bytesToHex` instead of `Buffer.toString`.
+- `src/preflight.ts`: the cache-key fingerprints (`callFingerprint`,
+  `configFingerprint`) move from `node:crypto` to the same `hash.ts` helpers,
+  keeping the existing 4-byte big-endian length framing — the length prefix is
+  now written through a `DataView` instead of `Buffer.writeUInt32BE`, so every
+  framed part hashes to the same bytes in the same order. `CheckBatchOptions`
+  additionally gains optional `onStep`, `signal` and `timeoutMs`, forwarded
+  unchanged to each call's `check()`; that is option plumbing, not verdict logic.
+
+Unchanged, deliberately: the authorization preimage layout and nonce policy,
+the credential kinds answered, probe → sign → enforced-simulation ordering,
+footprint assembly, submission, and block classification. SHA-256 is SHA-256:
+the digest inputs are the same bytes in the same order, so the signature the
+contract verifies is byte-identical. The five scenarios recorded above are
+produced by the contract during enforced simulation; no line this PR touches
+changes what the contract decides.
+
+Also fixed on this branch while repairing CI after the merge of `main`: the
+merge left `src/telemetry.ts` using `sha256Hex`, `utf8Length` and `bytesToHex`
+without importing them, after `node:crypto` was removed from the file — the
+missing `./hash.ts` import was the `typecheck` failure, and it is now in place.
+
+### What did run locally (Node v24.21.0, matching the package's engine)
+
+```text
+npm run typecheck                        # clean
+npm run check:strict-ratchet             # ok
+npm run lint                             # clean
+npm test                                 # 821 tests, 820 pass, 0 fail, 1 skipped
+npm run test:coverage:floor              # ok — 96.92% statements on the enforcement path
+npm run build                            # clean
+npm run test:browser                     # ok — root entry bundles with no node:* imports
+npm run test:types:packed                # ok — consumer compiles against the packed tarball
+npm run test:smoke                       # ok — 154 exports resolve via the ESM export map
+npm run test:exports                     # ok — every declared subpath resolves
+npm run check:bundle-size                # within budget
+node scripts/check-enforcement-evidence.ts upstream/main HEAD
+                                        # pass; evidence file detected as updated
+```
+
+The touched paths are covered without network by `tests/unit/tx.test.ts` and
+`tests/unit/preflight.test.ts` against mocks and recorded fixtures, and
+`npm run test:browser` proves the root entry still bundles with no `node:*`
+imports. Those are mocks and a static bundle check; they cannot substitute for
+the live run, and this addendum does not claim otherwise.
+
+**A maintainer with `.env.phase2` should run `npm run test:integration` against
+this branch before merge** and replace this addendum with the fresh run output.
+No credentials, deployment or policy change are needed beyond what the suite
+already does.
+
 
