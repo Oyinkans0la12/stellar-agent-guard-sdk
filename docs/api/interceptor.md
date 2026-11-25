@@ -117,6 +117,25 @@ existed.
 
 Evaluates a contract call against the guard without throwing or broadcasting.
 
+Every failure it surfaces is a typed guard error. Invalid caller input rejects
+with `InvalidInputError` before any RPC (unwrapped). Any other throwable from the
+enforcement path — a custom `Clock`, an injected server, a mapper — never escapes:
+it becomes the fail-closed `undetermined` verdict with a `GuardError` whose
+`cause` is the original value (a `GuardUndeterminedError` when the pipeline had
+not already classified the failure). The verdict is never upgraded to
+`admissible`.
+
+### `warmCache(calls: ContractCall[], options?): Promise<WarmCacheSummary>`
+
+Runs each call through the same `check()` path to populate the opt-in cache
+deliberately — for example after a policy install or a restart — and returns
+`{ attempted, cached, blocked, undetermined, durationMs }`. It stores only the
+cacheable `admissible`/`blocked` verdicts, respects the same `maxEntries`, TTL and
+policy revision, and reports a blocked or undetermined call instead of throwing.
+With `cache` omitted, nothing is stored and `cached` is `0`. Warming is an
+optimization, not a guarantee: verdicts can be stale or evicted before use, and
+another process does not share this cache.
+
 ### `invalidate(call?: ContractCall): void`
 
 Clears all cached decisions, or only the entries for the supplied call.
@@ -219,6 +238,11 @@ below are every limitation the SDK documents, plus the opt-in cache's
 staleness caveat; each row names what can differ, the function that mitigates
 it, the test that pins that mitigation, the residual risk, and what to do
 instead. **None of these gaps is a capability the SDK claims to fix.**
+
+The verdict boundary is part of the contract: `InvalidInputError` is thrown
+before any RPC, everything the enforcement pipeline can throw is converted to a
+fail-closed `undetermined` verdict carrying a typed guard error (with the
+original value on `cause`), and no other throwable escapes `check()`.
 
 | Gap | What can differ | Mitigation (code + pinning test) | Residual risk | What to do instead |
 | --- | --- | --- | --- | --- |

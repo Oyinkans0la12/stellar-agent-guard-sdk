@@ -416,6 +416,28 @@ export interface PreFlightBatchDecision {
 /** A caller-supplied policy revision token used as part of the cache key. */
 export type PolicyRevision = string | number | bigint | boolean | null | undefined;
 
+/** Per-call bound shared by `warmCache()`'s checks. */
+export interface WarmCacheOptions {
+  /** Abort signal forwarded to every warmed `check()`. */
+  signal?: AbortSignal | undefined;
+  /** Per-RPC timeout forwarded to every warmed `check()`. */
+  timeoutMs?: number | undefined;
+}
+
+/** What `warmCache()` did, which is an optimization report — not a verdict. */
+export interface WarmCacheSummary {
+  /** Calls passed to `warmCache()`. */
+  attempted: number;
+  /** Verdicts stored (or already served from) the cache; `0` when disabled. */
+  cached: number;
+  /** Blocked verdicts, reported rather than thrown. */
+  blocked: number;
+  /** Verdicts that could not be determined, reported rather than thrown. */
+  undetermined: number;
+  /** Wall-clock duration of the warming pass, in milliseconds. */
+  durationMs: number;
+}
+
 /**
  * Per-call options for `check()`.
  *
@@ -694,6 +716,28 @@ type CacheLookup =
   | { kind: "unavailable" }
   | { kind: "bounded"; error: RpcTimeoutError };
 
+/**
+ * The fail-closed verdict for an unexpected throw escaping `check()`.
+ *
+ * The original value becomes `cause` whether or not it is an `Error`, so a
+ * string or plain-object rejection is preserved rather than stringified away.
+ * The verdict is always `undetermined`: a failure the guard did not rule on
+ * can never be reported as `admissible`.
+ */
+function undeterminedFromThrow(cause: unknown): PreFlightDecision {
+  const detail = cause instanceof Error ? cause.message : String(cause);
+  const message = `pre-flight enforcement failed unexpectedly: ${detail}`;
+  return {
+    allowed: false,
+    kind: "undetermined",
+    detail: message,
+    error:
+      cause instanceof GuardUndeterminedError
+        ? cause
+        : new GuardUndeterminedError(message, { stage: "preflight", cause, detail }),
+  };
+}
+
 /** The fail-closed verdict for a caller bound that fired. */
 function timeoutDecision(error: RpcTimeoutError): PreFlightDecision {
   const outcome = timeoutOutcome(error);
@@ -753,6 +797,7 @@ export class PreFlightInterceptor {
   private _hits = 0;
   private _misses = 0;
   private _invalidations = 0;
+  private _stores = 0;
 
   constructor(input: PreFlightConfigInput) {
     // Shared transport (issue #117): exactly one of `server` or `url`.
@@ -841,6 +886,7 @@ export class PreFlightInterceptor {
       }
     }
     this.cache.set(key, entry);
+    this._stores += 1;
   }
 
   private cacheTtlMs(): number {
@@ -963,10 +1009,25 @@ export class PreFlightInterceptor {
     // Input validation throws before a verdict exists, so it never reaches the
     // observer: `onVerdict` reports decisions, not caller mistakes.
     validateContractCall(call);
-    const startedAt = this.clock.now();
-    const result = await this.decide(call, options);
-    this.emitVerdict(call, result.decision, startedAt, result.cached, result.ledger);
-    return result.decision;
+    let startedAt: number | undefined;
+    try {
+      startedAt = this.clock.now();
+      const result = await this.decide(call, options);
+      this.emitVerdict(call, result.decision, startedAt, result.cached, result.ledger);
+      return result.decision;
+    } catch (cause) {
+      // Every other throwable is a fail-closed verdict, not a rejection: an
+      // unexpected failure (a custom `Clock`, an injected server, a mapper)
+      // must never escape and be misclassified by an adapter.
+      if (cause instanceof InvalidInputError) throw cause;
+      const decision = undeterminedFromThrow(cause);
+      // The observer needs the clock that just failed, so a broken clock must
+      // not turn the fail-closed verdict back into a rejection.
+      if (startedAt !== undefined) {
+        this.emitVerdict(call, decision, startedAt, false, undefined);
+      }
+      return decision;
+    }
   }
 
   /**
@@ -1178,10 +1239,16 @@ export class PreFlightInterceptor {
   ): void {
     const hook = this.config.onVerdict;
     if (!hook) return;
+    let now = startedAt;
+    try {
+      now = this.clock.now();
+    } catch {
+      /* a broken clock cannot stop the verdict from being reported */
+    }
     const event: PreFlightVerdictEvent = {
       kind: decision.kind,
       cached,
-      durationMs: Math.max(0, this.clock.now() - startedAt),
+      durationMs: Math.max(0, now - startedAt),
       call: { fn: call.fn, contract: call.contract },
       ...(decision.kind === "blocked" ? { reason: decision.reason } : {}),
       ...(ledger !== undefined ? { ledger } : {}),
@@ -1724,6 +1791,53 @@ export class PreFlightInterceptor {
             },
           }
         : {}),
+    };
+  }
+
+  /**
+   * Populate the cache deliberately for a known set of calls.
+   *
+   * Runs each call through the same `check()` path, so warming uses exactly the
+   * cache a later check would consult: the same ledger marker, TTL, policy
+   * revision and `maxEntries` eviction. Only cacheable `admissible` and
+   * `blocked` verdicts are stored; `undetermined` verdicts are not (and never
+   * were). A blocked or undetermined call is reported in the summary, never
+   * thrown.
+   *
+   * Warming is an optimization, not a guarantee: a warmed verdict can be stale
+   * or evicted before the call it was meant for, and another process does not
+   * share this cache. With caching disabled by config (`cache` omitted) nothing
+   * is stored and `cached` is `0`.
+   */
+  async warmCache(
+    calls: ContractCall[],
+    options?: WarmCacheOptions,
+  ): Promise<WarmCacheSummary> {
+    const startedAt = this.clock.now();
+    let cached = 0;
+    let blocked = 0;
+    let undetermined = 0;
+
+    for (const call of calls) {
+      const hitsBefore = this._hits;
+      const storesBefore = this._stores;
+      const decision = await this.check(call, options);
+      if (decision.kind === "undetermined") {
+        undetermined += 1;
+        continue;
+      }
+      if (decision.kind === "blocked") blocked += 1;
+      // "Cached" means a later check can reuse this verdict: either this pass
+      // stored it, or it was already served from the cache.
+      if (this._hits > hitsBefore || this._stores > storesBefore) cached += 1;
+    }
+
+    return {
+      attempted: calls.length,
+      cached,
+      blocked,
+      undetermined,
+      durationMs: this.clock.now() - startedAt,
     };
   }
 
