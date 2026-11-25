@@ -47,6 +47,19 @@ Present only when you opt in. Entries are also discarded whenever the observed l
 | `onStep` | `(step: InvokeStepEvent) => void` | none | One event per enforcement-stage attempt (probe → sign → simulate). Supplying it opts this check out of coalescing. |
 | `signal` | `AbortSignal` | none | ⚠️ Caller cancellation. An already-aborted signal returns before any RPC; a fired signal returns the fail-closed `undetermined` verdict carrying `RpcTimeoutError`, never a throw and never `admissible`. |
 | `timeoutMs` | `number` | `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms) per RPC call | ⚠️ A fired timeout returns the same fail-closed `undetermined` verdict as an abort. `0` disables the per-call timeout: with no `signal`, a stalled RPC can then hold the check open. |
+
+#### `SimulationDiagnosticsOptions` / `SimulationDiagnostics` (`simulateForDiagnostics()`)
+
+`simulateForDiagnostics(call, options?)` runs the same probe and enforced simulation as `check()` but returns **no verdict** — `authoritative` is the literal `false`. It is a debugging surface: nothing is signed for submission, broadcast or cached.
+
+| Option | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `signal` | `AbortSignal` | none | Bounds the RPC calls exactly as `check()` does. |
+| `timeoutMs` | `number` | `DEFAULT_RPC_TIMEOUT_MS` | Per-call bound, as in `check()`. |
+| `onStep` | `(step: InvokeStepEvent) => void` | none | Observes the enforcement-stage attempts. |
+| `includeRaw` | `boolean` | `false` | Retains the undecoded source payload on each decoded event. Off by default, so diagnostics are redacted. |
+
+The result carries `ok`, `detail`, `resources`, `resourceFeeStroops`, decoded `events`, the first `guardEvent`, and the typed `error` when the simulations could not complete. |
 | `forceFresh` | `boolean` | `false` | Bypasses the verdict cache for this call: a new simulation runs, no cached verdict is reused, and no coalesced run is joined. The cache is left untouched (nothing read, nothing stored). Use it before a high-value transfer when a hit's `ageMs`/`observedLedger` is older than you accept. |
 
 #### `CheckBatchOptions` (`checkBatch()` / `assertBatchAllowed()`)
@@ -58,7 +71,7 @@ Present only when you opt in. Entries are also discarded whenever the observed l
 | `onStep` | `(step: InvokeStepEvent) => void` | none | Forwarded to each call's `check()`. |
 | `signal` | `AbortSignal` | none | ⚠️ Forwarded to each call's `check()`: once it fires, every remaining call returns a fail-closed `undetermined` verdict without issuing an RPC. It does **not** bound the initial `Policy`/`Window` ledger reads; supply `policy` and `initialWindowSpent` to avoid them. |
 | `timeoutMs` | `number` | `DEFAULT_RPC_TIMEOUT_MS` (30 000 ms), per call | Forwarded to each `check()`; a fired timeout makes that call `undetermined` and the batch continues. |
-| `deadlineMs` | `number` | none | Validated (must be positive and finite, otherwise `RangeError`). ⚠️ **Not currently enforced** in `checkBatch()`: the value is checked but no overall budget is applied. Bound a batch with `signal` (e.g. `AbortSignal.timeout(ms)`) and `timeoutMs` until it is. |
+| `deadlineMs` | `number` (> 0) | none | One absolute budget for the whole batch, measured on the injected `clock`. Once spent, no further call starts and every unfinished call is a fail-closed `undetermined` verdict carrying an `RpcTimeoutError` with `deadline: true`. A batch that exceeds its deadline is never `admissible`; `timeoutMs` stays per-call, capped by the remaining budget. |
 
 ### Optional cache
 

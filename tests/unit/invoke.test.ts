@@ -28,7 +28,12 @@ import {
 import { DEFAULT_INVOKE_RETRY_OPTIONS, invoke, InvokeRetryError } from "../../src/invoke.ts";
 import type { InvokeParams } from "../../src/invoke.ts";
 import { BroadcastError } from "../../src/tx.ts";
-import { ContractResponseError, InvalidInputError, SimulationError } from "../../src/errors.ts";
+import {
+  ContractResponseError,
+  FeeCapExceededError,
+  InvalidInputError,
+  SimulationError,
+} from "../../src/errors.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
 import { FakeClock, type Clock } from "../../src/clock.ts";
 import { TRACE_STEP_NAMES, type TraceStepName } from "../../src/trace.ts";
@@ -2307,5 +2312,59 @@ describe("invoke() pending outcome (issue #299)", () => {
     assert.equal(outcome.kind, "error");
     if (outcome.kind !== "error") throw new Error("unreachable");
     assert.equal(outcome.transactionHash, HASH, "the deadline error keeps the hash");
+  });
+});
+
+describe("invoke() maxFeeStroops: fail closed before broadcast", () => {
+  it("returns a FeeCapExceededError and makes zero broadcast attempts when over budget", async () => {
+    const server = createMockServer();
+
+    const outcome = await invoke(makeParams(server, { maxFeeStroops: 199n }));
+
+    assert.equal(outcome.kind, "error");
+    if (outcome.kind !== "error") throw new Error("unreachable");
+    assert.ok(outcome.error instanceof FeeCapExceededError);
+    assert.equal(outcome.error.totalFeeStroops, 200n);
+    assert.equal(outcome.error.resourceFeeStroops, 100n);
+    assert.equal(outcome.error.inclusionFeeStroops, 100n);
+    assert.equal(outcome.error.maxFeeCap, 199n);
+    assert.equal(server.sendCount, 0, "nothing may be broadcast");
+    assert.equal(outcome.detail?.includes("nothing was broadcast"), true);
+  });
+
+  it("allows a total exactly at the ceiling", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const server = createMockServer();
+
+    const pending = invoke(makeParams(server, { maxFeeStroops: 200n }));
+    await drainWithMockedTimers(t.mock.timers, pending);
+    const outcome = await pending;
+
+    assert.equal(outcome.kind, "allowed");
+    assert.equal(server.sendCount, 1);
+  });
+
+  it("uses the same comparison for a dry run, without broadcasting", async () => {
+    const server = createMockServer();
+
+    const outcome = await invoke(makeParams(server, { maxFeeStroops: 199n, dryRun: true }));
+
+    assert.equal(outcome.kind, "dry_run");
+    if (outcome.kind !== "dry_run") throw new Error("unreachable");
+    assert.equal(outcome.admissible, false);
+    assert.equal(outcome.verdict, "undetermined");
+    assert.ok(outcome.error instanceof FeeCapExceededError);
+    assert.equal(server.sendCount, 0);
+  });
+
+  it("leaves behaviour unchanged when the option is omitted", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const server = createMockServer();
+
+    const pending = invoke(makeParams(server));
+    await drainWithMockedTimers(t.mock.timers, pending);
+    const outcome = await pending;
+
+    assert.equal(outcome.kind, "allowed");
   });
 });

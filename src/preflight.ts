@@ -51,6 +51,7 @@ import {
 } from "./policy.ts";
 import { GuardBlockedError, explainReason } from "./reasons.ts";
 import type { EnforcementOutcome, InvokeStepEvent } from "./invoke.ts";
+import { guardEventsFromDiagnostics, type GuardEvent } from "./telemetry.ts";
 import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
 import { parseSimulationResourceFee, toAgentSigner } from "./tx.ts";
 import type { AgentSigner, ContractCall } from "./tx.ts";
@@ -294,6 +295,49 @@ export interface CheckBatchOptions {
    * a single long RPC cannot overrun it. Omit for the per-call default.
    */
   deadlineMs?: number | undefined;
+}
+
+/**
+ * Options for `simulateForDiagnostics()`.
+ *
+ * `signal` and `timeoutMs` bound the RPC calls exactly as they do for
+ * `check()`. `includeRaw` opts into retaining the undecoded source event on
+ * each decoded event's `raw` field; it defaults to `false`, so diagnostics are
+ * redacted of host payloads unless the caller asks for them.
+ */
+export interface SimulationDiagnosticsOptions {
+  onStep?: (step: InvokeStepEvent) => void;
+  signal?: AbortSignal | undefined;
+  timeoutMs?: number | undefined;
+  includeRaw?: boolean | undefined;
+}
+
+/**
+ * The non-authoritative result of `simulateForDiagnostics()`.
+ *
+ * This is deliberately **not** a verdict: it has no `allowed`, `admissible`,
+ * `blocked` or `undetermined` field, and `authoritative` is the literal
+ * `false`. It reports what the network's simulation said, so a caller can
+ * inspect an `undetermined` outcome without pretending the guard decided
+ * anything. Nothing is signed for submission and nothing is broadcast.
+ */
+export interface SimulationDiagnostics {
+  /** Always `false`: this result never answers the enforcement question. */
+  readonly authoritative: false;
+  /** True when both the probe and the enforced simulation ran successfully. */
+  readonly ok: boolean;
+  /** Human-readable failure text, or `null` when the simulations succeeded. */
+  readonly detail: string | null;
+  /** Resource usage from the enforced simulation, when it succeeded. */
+  readonly resources: ResourceBreakdown | null;
+  /** Simulated resource fee in stroops, when it parsed successfully. */
+  readonly resourceFeeStroops: bigint | null;
+  /** Decoded guard events; raw payloads only when `includeRaw` was set. */
+  readonly events: GuardEvent[];
+  /** The first decoded `event_auth_checked` decision, if there was one. */
+  readonly guardEvent: GuardEvent | null;
+  /** The typed failure, when the simulations could not complete. */
+  readonly error: GuardError | null;
 }
 
 /**
@@ -926,6 +970,77 @@ export class PreFlightInterceptor {
   }
 
   /**
+   * Run the probe and enforced simulation for diagnostics only.
+   *
+   * This exposes the same pipeline `check()` uses — same transport, auth entry,
+   * signing and timeout handling — but returns no verdict. The result is
+   * explicitly non-authoritative (`authoritative: false`), so an integrator can
+   * inspect an `undetermined` case without mistaking the network's answer for a
+   * policy decision. Nothing is signed for submission and nothing is broadcast,
+   * and the result is never cached or coalesced.
+   */
+  async simulateForDiagnostics(
+    call: ContractCall,
+    options?: SimulationDiagnosticsOptions,
+  ): Promise<SimulationDiagnostics> {
+    validateContractCall(call);
+    const abandoned = new AbortController();
+    let outcome: EnforcementOutcome;
+    try {
+      outcome = await withRpcAbort(
+        {
+          stage: "pre-flight",
+          signal: options?.signal,
+          timeoutMs: options?.timeoutMs,
+        },
+        () => this.simulateLimited(call, options?.onStep, abandoned.signal),
+      );
+    } catch (error) {
+      abandoned.abort();
+      if (!(error instanceof RpcTimeoutError)) throw error;
+      outcome = timeoutOutcome(error);
+    }
+
+    const rawDiagnostics = outcome.kind === "admissible" ? [] : outcome.diagnosticEvents;
+    const events = guardEventsFromDiagnostics(rawDiagnostics, this.config.guard, {
+      includeRaw: options?.includeRaw === true,
+    });
+    const guardEvent = events.find((event) => event.kind === "auth_checked") ?? null;
+
+    if (outcome.kind !== "admissible") {
+      return {
+        authoritative: false,
+        ok: false,
+        detail: outcome.detail,
+        resources: null,
+        resourceFeeStroops: null,
+        events,
+        guardEvent,
+        error: outcome.kind === "error" ? outcome.error : null,
+      };
+    }
+
+    let resourceFeeStroops: bigint | null;
+    try {
+      resourceFeeStroops = parseSimulationResourceFee(outcome.simulation.minResourceFee, {
+        stage: "preflight",
+      });
+    } catch {
+      resourceFeeStroops = null;
+    }
+    return {
+      authoritative: false,
+      ok: true,
+      detail: null,
+      resources: resourceBreakdownFromSimulation(outcome.simulation) ?? null,
+      resourceFeeStroops,
+      events,
+      guardEvent,
+      error: null,
+    };
+  }
+
+  /**
    * The decision path behind `check()`, returning the verdict together with its
    * cache provenance so `check()` can notify the observer exactly once.
    */
@@ -1365,6 +1480,29 @@ export class PreFlightInterceptor {
       }
     }
 
+    // One absolute budget for the whole batch, measured on the interceptor's
+    // injected clock. It is checked before each call starts, and again when a
+    // call finishes: a verdict that arrives after the budget is spent cannot
+    // make the batch admissible, so it is replaced by the fail-closed timeout.
+    const deadlineAt =
+      options?.deadlineMs === undefined ? undefined : this.clock.now() + options.deadlineMs;
+    const deadlineExpired = (): boolean =>
+      deadlineAt !== undefined && this.clock.now() >= deadlineAt;
+    const deadlineVerdict = (): PreFlightDecision => {
+      const error = new RpcTimeoutError({
+        stage: "pre-flight",
+        aborted: false,
+        deadline: true,
+        ...(options?.deadlineMs !== undefined ? { timeoutMs: options.deadlineMs } : {}),
+      });
+      return {
+        allowed: false,
+        kind: "undetermined",
+        detail: error.message,
+        error,
+      };
+    };
+
     if (calls.length === 0) {
       return {
         admissible: true,
@@ -1459,13 +1597,38 @@ export class PreFlightInterceptor {
     };
 
     for (const call of calls) {
+      // The budget is spent: start no further simulation and report every
+      // remaining call fail-closed. Recording the verdict here (rather than
+      // `break`) keeps `verdicts` aligned with `calls`.
+      if (deadlineExpired()) {
+        verdicts.push(deadlineVerdict());
+        continue;
+      }
+      // A single check cannot outlive the batch budget: cap its per-call
+      // timeout by the remaining time (and use the remaining budget when no
+      // per-call timeout was supplied).
+      const remainingMs =
+        deadlineAt === undefined ? undefined : Math.max(1, Math.ceil(deadlineAt - this.clock.now()));
+      const perCallTimeoutMs =
+        remainingMs === undefined
+          ? options?.timeoutMs
+          : options?.timeoutMs === undefined || options.timeoutMs === 0
+            ? remainingMs
+            : Math.min(options.timeoutMs, remainingMs);
       const checkOptions: PreFlightCheckOptions = {
         ...(options?.onStep ? { onStep: options.onStep } : {}),
         ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+        ...(perCallTimeoutMs !== undefined ? { timeoutMs: perCallTimeoutMs } : {}),
       };
 
-      const decision = await this.check(call, checkOptions);
+      let decision = await this.check(call, checkOptions);
+
+      // A verdict that landed after the budget was spent is not a usable
+      // batch result: the caller has no time left to act on it. A blocked
+      // verdict keeps its kind because it is definitive either way.
+      if (decision.kind !== "blocked" && deadlineExpired()) {
+        decision = deadlineVerdict();
+      }
 
       if (decision.kind === "admissible") {
         const amount = extractTransferAmount(call);

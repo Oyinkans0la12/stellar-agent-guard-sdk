@@ -21,6 +21,29 @@ the action.
 The current API does not expose `concurrency` or `startFrom`; do not add either
 to an integration config expecting the SDK to act on it. Limit parallel work in
 the caller, and use the supported timeout, cursor, and listener options above.
+## Inspecting an `undetermined` check without a verdict
+
+When `check()` returns `undetermined`, the guard made no ruling — but the raw
+simulation is often what explains why. `simulateForDiagnostics()` runs the same
+probe and enforced simulation under the same transport, signing and
+`signal`/`timeoutMs` bounds, and returns diagnostics instead of a verdict:
+
+```ts
+const diagnostics = await interceptor.simulateForDiagnostics(call, {
+  timeoutMs: 5_000,
+  // includeRaw: true, // opt in to the undecoded event payloads
+});
+
+diagnostics.authoritative; // always false — never a policy verdict
+if (!diagnostics.ok) console.error(diagnostics.error, diagnostics.detail);
+console.log(diagnostics.resourceFeeStroops, diagnostics.resources);
+console.log(diagnostics.guardEvent?.decision);
+```
+
+The result is explicitly non-authoritative (`authoritative: false`), performs no
+broadcast and signs nothing for submission, and `includeRaw` defaults to `false`
+so host payloads are redacted unless you ask for them.
+
 ## Authorization entries not signed
 
 Ensure the invoke pipeline receives a valid agent key and that the custom account `__check_auth` policy admits the call. Blocked calls are rejected client-side before broadcast.
@@ -212,7 +235,7 @@ export RPC_URL=https://soroban-testnet.stellar.org
 - **Extends:** `GuardError`. `code` is `"fee_cap_exceeded"`.
 - **Typical messages:** `fee cap exceeded: total <n> stroops (resource <n> + inclusion <n>) exceeds maxFeeCap <n> stroops; nothing was broadcast`.
 - **Stage:** `invoke()`, before `sendTransaction`. Nothing was broadcast.
-- **Retry:** No — your own spend ceiling stopped it. Raise `maxFeeCap` only if the budget allows, or wait for resource fees to fall.
+- **Retry:** No — your own spend ceiling stopped it. Raise the ceiling (`invoke()`'s `maxFeeStroops`, or `CostPreChecker`'s `maxFeeStroops`) only if the budget allows, or wait for resource fees to fall.
 - **First diagnostic:** see which half grew:
 
   ```ts

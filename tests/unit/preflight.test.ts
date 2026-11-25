@@ -2933,3 +2933,233 @@ describe("onVerdict observer (#408)", () => {
     assert.equal(decision.kind, "admissible");
   });
 });
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Batch deadline (#407): `deadlineMs` is one absolute budget for the whole
+ * batch, not a per-call value and not documentation-only. Time is advanced by
+ * the mock server so the test never sleeps.
+ */
+describe("PreFlightInterceptor.checkBatch() deadline enforcement (#407)", () => {
+  function deadlineServer(onSimulate: (clock: { advance: (ms: number) => void }) => void) {
+    let simulations = 0;
+    const clock = {
+      now: 0,
+      advance(ms: number) {
+        this.now += ms;
+      },
+    };
+    const server = {
+      getAccount: async () => new Account(Keypair.random().publicKey(), "1"),
+      getLatestLedger: async () => ({ sequence: 100 }),
+      simulateTransaction: async () => {
+        simulations += 1;
+        onSimulate(clock);
+        return {
+          result: { auth: [] },
+          minResourceFee: "10",
+          transactionData: { getReadOnly: () => [], getReadWrite: () => [] },
+        };
+      },
+    } as unknown as rpc.Server;
+    return {
+      server,
+      clock: { now: () => clock.now, sleep: async (ms: number) => clock.advance(ms) },
+      simulations: () => simulations,
+    };
+  }
+
+  const batchOptions = { policy: null, initialWindowSpent: 0n };
+
+  it("starts no further calls once the budget is spent and fails them closed", async () => {
+    const harness = deadlineServer((clock) => clock.advance(40));
+    const interceptor = new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+      clock: harness.clock,
+    });
+
+    const decision = await interceptor.checkBatch(
+      [validTransferCall(1n), validTransferCall(2n), validTransferCall(3n)],
+      { ...batchOptions, deadlineMs: 100 },
+    );
+
+    // Call 1 finishes at 80ms (admissible); call 2 starts at 80 and lands at
+    // 120 (after the deadline, so it is replaced); call 3 never starts.
+    assert.equal(decision.admissible, false);
+    assert.equal(decision.kind, "undetermined");
+    assert.equal(decision.verdicts.length, 3);
+    assert.equal(decision.verdicts[0]?.kind, "admissible", "completed verdicts keep their kind");
+    for (const verdict of decision.verdicts.slice(1)) {
+      assert.equal(verdict.kind, "undetermined");
+      if (verdict.kind !== "undetermined") throw new Error("unreachable");
+      assert.ok(verdict.error instanceof RpcTimeoutError);
+      assert.equal(verdict.error.deadline, true);
+    }
+    assert.equal(harness.simulations(), 4, "the third call must issue no RPC");
+  });
+
+  it("never returns admissible when the last started call overruns the budget", async () => {
+    const harness = deadlineServer((clock) => clock.advance(60));
+    const interceptor = new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+      clock: harness.clock,
+    });
+
+    const decision = await interceptor.checkBatch([validTransferCall()], {
+      ...batchOptions,
+      deadlineMs: 100,
+    });
+
+    assert.equal(decision.admissible, false);
+    const verdict = decision.verdicts[0];
+    assert.equal(verdict?.kind, "undetermined");
+    if (verdict?.kind !== "undetermined") throw new Error("unreachable");
+    assert.ok(verdict.error instanceof RpcTimeoutError);
+    assert.equal(verdict.error.deadline, true);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Diagnostics-only simulation (#411): exposes the enforced pipeline without
+ * producing a verdict, with redaction controlled by `includeRaw`.
+ */
+describe("PreFlightInterceptor.simulateForDiagnostics() (#411)", () => {
+  function diagnosticsInterceptor(enforced: unknown) {
+    let simulations = 0;
+    const server = {
+      getAccount: async () => new Account(Keypair.random().publicKey(), "1"),
+      getLatestLedger: async () => ({ sequence: 100 }),
+      simulateTransaction: async () => {
+        simulations += 1;
+        if (simulations % 2 === 0) return enforced;
+        return {
+          result: { auth: [] },
+          minResourceFee: "10",
+          transactionData: { getReadOnly: () => [], getReadWrite: () => [] },
+        };
+      },
+    } as unknown as rpc.Server;
+    return {
+      interceptor: new PreFlightInterceptor({
+        server,
+        networkPassphrase: "Test SDF Network ; September 2015",
+        guard: VALID_GUARD,
+        agent: Keypair.random(),
+        source: Keypair.random(),
+      }),
+      simulations: () => simulations,
+    };
+  }
+
+  function blockedSimulation() {
+    return {
+      error: "blocked",
+      events: [
+        {
+          event: {
+            contractId: VALID_GUARD,
+            body: {
+              v0: {
+                topics: [
+                  xdr.ScVal.scvSymbol("event_auth_checked"),
+                  xdr.ScVal.scvSymbol("blocked"),
+                  xdr.ScVal.scvSymbol("per_tx_cap_exceeded"),
+                ],
+                data: xdr.ScVal.scvVoid(),
+              },
+            },
+          },
+        },
+      ],
+    };
+  }
+
+  it("returns no verdict, decodes the guard event and redacts raw payloads by default", async () => {
+    const harness = diagnosticsInterceptor(blockedSimulation());
+
+    const diagnostics = await harness.interceptor.simulateForDiagnostics(validTransferCall());
+
+    assert.equal(diagnostics.authoritative, false);
+    assert.equal("allowed" in diagnostics, false);
+    assert.equal("admissible" in diagnostics, false);
+    assert.equal(diagnostics.ok, false);
+    assert.equal(diagnostics.guardEvent?.decision?.result, "blocked");
+    assert.equal(diagnostics.guardEvent?.decision?.reason, "per_tx_cap_exceeded");
+    assert.equal(diagnostics.events[0]?.raw, undefined, "raw payloads are redacted by default");
+    // Both probe and enforced simulation ran; no broadcast path exists here.
+    assert.equal(harness.simulations(), 2);
+  });
+
+  it("retains raw payloads when includeRaw is set", async () => {
+    const harness = diagnosticsInterceptor(blockedSimulation());
+
+    const diagnostics = await harness.interceptor.simulateForDiagnostics(validTransferCall(), {
+      includeRaw: true,
+    });
+
+    assert.notEqual(diagnostics.events[0]?.raw, undefined);
+  });
+
+  it("reports a network failure as a typed error, not a verdict", async () => {
+    const harness = diagnosticsInterceptor(blockedSimulation());
+    // Make the probe fail before any decision can be reached.
+    const failing = new PreFlightInterceptor({
+      server: {
+        getAccount: async () => {
+          throw new Error("network down");
+        },
+      } as unknown as rpc.Server,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+    });
+
+    const diagnostics = await failing.simulateForDiagnostics(validTransferCall());
+
+    assert.equal(diagnostics.authoritative, false);
+    assert.equal(diagnostics.ok, false);
+    assert.ok(diagnostics.error instanceof GuardError);
+    assert.equal(diagnostics.guardEvent, null);
+    assert.equal(harness.simulations(), 0);
+  });
+
+  it("bounds the run with timeoutMs and signs nothing for submission", async () => {
+    let simulations = 0;
+    const stalled = {
+      getAccount: async () => new Account(Keypair.random().publicKey(), "1"),
+      getLatestLedger: async () => ({ sequence: 100 }),
+      simulateTransaction: async () => {
+        simulations += 1;
+        return new Promise(() => {});
+      },
+    } as unknown as rpc.Server;
+    const interceptor = new PreFlightInterceptor({
+      server: stalled,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+    });
+
+    const diagnostics = await interceptor.simulateForDiagnostics(validTransferCall(), {
+      timeoutMs: 10,
+    });
+
+    assert.equal(diagnostics.authoritative, false);
+    assert.equal(diagnostics.ok, false);
+    assert.ok(diagnostics.error instanceof RpcTimeoutError);
+    assert.equal(simulations, 1);
+  });
+});

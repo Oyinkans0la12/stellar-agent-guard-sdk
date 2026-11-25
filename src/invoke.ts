@@ -21,6 +21,7 @@ import { feeBreakdown, type FeeBreakdown } from "./cost.ts";
 import {
   BroadcastError,
   ContractResponseError,
+  FeeCapExceededError,
   GuardError,
   SigningError,
   SimulationError,
@@ -561,6 +562,16 @@ export interface InvokeParams {
    */
   signal?: AbortSignal | undefined;
   /**
+   * Optional total-fee ceiling for this invocation, in stroops. After the
+   * enforced simulation succeeds, the simulated resource fee plus the inclusion
+   * fee the attempt would declare is compared against this value; a total above
+   * the ceiling stops the pipeline before assembly or broadcast and returns an
+   * `error` outcome carrying `FeeCapExceededError`. A total exactly at the
+   * ceiling is allowed. Omitted by default, so existing behaviour is unchanged.
+   * Reuses the same resource/inclusion split as `CostPreChecker`.
+   */
+  maxFeeStroops?: bigint | string | undefined;
+  /**
    * Bound on each individual RPC call, in milliseconds. Defaults to
    * `DEFAULT_RPC_TIMEOUT_MS` (30s); pass `0` to disable the timeout and rely
    * solely on `signal`. A fired timeout produces the same `RpcTimeoutError`
@@ -832,6 +843,9 @@ function validateInvokeOptions(params: InvokeParams): void {
     }
   }
 
+  if (params.maxFeeStroops !== undefined) {
+    normalizeFeeStroops(params.maxFeeStroops, "maxFeeStroops", false);
+  }
   if (params.timeoutMs !== undefined) {
     assertFiniteOption("timeoutMs", params.timeoutMs, 0);
   }
@@ -2431,6 +2445,37 @@ export async function enforceCall(
   // result: the caller has no time left to act on it, and `invokePipeline`
   // must not go on to assemble or broadcast.
   assertWithinDeadline(deadline, "simulate");
+
+  // A fee ceiling is enforced here, after the network has priced the call and
+  // before anything is assembled or broadcast. It shares `feeBreakdown` with
+  // `CostPreChecker`, so the two surfaces cannot disagree about what the total
+  // is; a total exactly at the ceiling is allowed (`exceeds` is strict).
+  if (params.maxFeeStroops !== undefined) {
+    const ceiling = normalizeFeeStroops(params.maxFeeStroops, "maxFeeStroops", false);
+    const resourceFeeStroops = parseSimulationResourceFee(
+      (enforced as rpc.Api.SimulateTransactionSuccessResponse).minResourceFee,
+      { stage: "simulate" },
+    );
+    const inclusionFeeStroops =
+      params.fee === undefined
+        ? BigInt(INCLUSION_FEE)
+        : normalizeFeeStroops(params.fee, "fee", false);
+    const fees = feeBreakdown(resourceFeeStroops, inclusionFeeStroops);
+    if (fees.totalFeeStroops > ceiling) {
+      const error = new FeeCapExceededError({
+        maxFeeCap: ceiling,
+        resourceFeeStroops: fees.resourceFeeStroops,
+        inclusionFeeStroops: fees.inclusionFeeStroops,
+        attempt,
+      });
+      return {
+        kind: "error",
+        detail: error.message,
+        error,
+        diagnosticEvents: [],
+      };
+    }
+  }
 
   return {
     kind: "admissible",

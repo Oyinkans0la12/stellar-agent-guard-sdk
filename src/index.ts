@@ -243,6 +243,8 @@ export type {
   PreFlightDecision,
   PreFlightInterceptorOptions,
   PreFlightUndeterminedCause,
+  SimulationDiagnostics,
+  SimulationDiagnosticsOptions,
 } from "./preflight.ts";
 
 export {
