@@ -112,4 +112,9 @@ export interface InvokeRetryMetadata {
   terminalCause: InvokeErrorCause | null;
   /** How the pipeline ended. */
   outcome: "allowed" | "blocked" | "pending" | "error";
+  /**
+   * `feeBump.maxInclusionFee` that stopped a fee-bump retry, as a decimal
+   * stroop string. Present only when the ceiling is what ended the pipeline.
+   */
+  maxInclusionFeeStroops?: string;
 }

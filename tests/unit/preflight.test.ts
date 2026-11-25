@@ -1096,6 +1096,146 @@ function callWithAmount(amount: bigint): ContractCall {
   };
 }
 
+describe("PreFlightInterceptor warmCache (issue #413)", () => {
+  it("warms the same cache path and reports counts that match it", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness, { cache: { ttlMs: 5_000 } });
+    const calls = [harness.call, callWithAmount(7n)];
+
+    const first = await interceptor.warmCache(calls);
+    assert.deepEqual(first, {
+      attempted: 2,
+      cached: 2,
+      blocked: 0,
+      undetermined: 0,
+      durationMs: first.durationMs,
+    });
+    assert.equal(harness.simulations, 4);
+    assert.equal(interceptor.getCacheStats().size, 2);
+
+    // A second warm reuses the stored verdicts rather than simulating again.
+    const second = await interceptor.warmCache(calls);
+    assert.equal(second.cached, 2);
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("reports a blocked call without throwing and caches the verdict", async () => {
+    const blockedErrorResponse = {
+      error: "transaction failed",
+      events: [
+        {
+          event: {
+            contractId: VALID_GUARD,
+            body: {
+              v0: {
+                topics: [
+                  xdr.ScVal.scvSymbol("event_auth_checked"),
+                  xdr.ScVal.scvSymbol("blocked"),
+                  xdr.ScVal.scvSymbol("per_tx_cap_exceeded"),
+                ],
+                data: xdr.ScVal.scvMap([]),
+              },
+            },
+          },
+        },
+      ],
+    };
+    const server = createMockServer({ enforcedSimulateResponse: blockedErrorResponse });
+    const interceptor = new PreFlightInterceptor({
+      server,
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+      cache: { ttlMs: 5_000 },
+    });
+
+    const summary = await interceptor.warmCache([validTransferCall(5_000n)]);
+    assert.equal(summary.attempted, 1);
+    assert.equal(summary.blocked, 1);
+    assert.equal(summary.cached, 1);
+    assert.equal(summary.undetermined, 0);
+    assert.equal(interceptor.getCacheStats().size, 1);
+  });
+
+  it("stores nothing when the cache is disabled by config", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+
+    const summary = await interceptor.warmCache([harness.call]);
+    assert.equal(summary.attempted, 1);
+    assert.equal(summary.cached, 0);
+    assert.equal(summary.blocked, 0);
+    assert.equal(summary.undetermined, 0);
+    assert.equal(interceptor.getCacheStats().size, 0);
+    assert.equal(harness.simulations, 2);
+  });
+});
+
+describe("check() typed-failure boundary (issue #412)", () => {
+  it("turns a server rejecting with a string or plain object into undetermined, preserving cause", async () => {
+    for (const thrown of ["boom", { code: "injected" }]) {
+      const source = Keypair.random();
+      const server = {
+        getAccount: async () => new Account(source.publicKey(), "1"),
+        getLatestLedger: async () => {
+          throw thrown;
+        },
+        simulateTransaction: async () => {
+          throw thrown;
+        },
+      } as unknown as rpc.Server;
+      const interceptor = new PreFlightInterceptor({
+        server,
+        networkPassphrase: "Test SDF Network ; September 2015",
+        guard: VALID_GUARD,
+        agent: source,
+        source,
+      });
+
+      // Never rejects, and never reports admissible. The pipeline already
+      // classifies a failed probe as a typed `SimulationError`; the original
+      // string/object survives as its `cause` rather than being stringified.
+      const decision = await interceptor.check(validTransferCall());
+      assert.equal(decision.kind, "undetermined");
+      assert.equal(decision.allowed, false);
+      assert.ok(decision.error instanceof GuardError);
+      assert.equal(decision.error.cause, thrown);
+    }
+  });
+
+  it("keeps InvalidInputError unwrapped and preserves the original value from a throwing clock", async () => {
+    const harness = makeHarness();
+    const thrown: unknown = "clock boom";
+    const clock: Clock = {
+      now: () => {
+        throw thrown;
+      },
+      sleep: async () => {},
+    };
+    const interceptor = new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      guard: CONTRACT,
+      agent: harness.source,
+      source: harness.source,
+      cache: { ttlMs: 5_000 },
+      clock,
+    });
+
+    const decision = await interceptor.check(harness.call);
+    assert.equal(decision.kind, "undetermined");
+    assert.ok(decision.error instanceof GuardUndeterminedError);
+    assert.equal(decision.error.cause, "clock boom");
+
+    await assert.rejects(
+      async () =>
+        interceptor.check({ contract: unsafeContractAddress(""), fn: "transfer", args: [] }),
+      InvalidInputError,
+    );
+  });
+});
+
 describe("PreFlightInterceptor simulation cache", () => {
   it("does not cache unless explicitly enabled", async () => {
     const harness = makeHarness();

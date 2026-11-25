@@ -390,3 +390,47 @@ node scripts/check-doc-links.ts
 
 The offline checks above passed; they do not substitute for the live-testnet
 scenarios.
+
+## Addendum — 2026-11-25 (PR: invoke queue observability, fee ceiling, preflight warmCache and typed failures; issues #423, #418, #413, #412)
+
+This PR touches `src/invoke.ts` and `src/preflight.ts`:
+
+- `onQueue` / `invokeQueueStats()` observe the existing per-source-account
+  queue. They add no new ordering, signing or RPC work: the queue semantics are
+  unchanged, and a throwing hook is swallowed.
+- `feeBump.maxInclusionFee` compares a fee-bump retry's already-computed
+  inclusion fee with a caller ceiling. A breach returns an `error` outcome
+  carrying `FeeCapExceededError` and never broadcasts the over-cap transaction;
+  it cannot turn a guard refusal into an approval.
+- `warmCache()` runs calls through the same `check()` path to populate the
+  opt-in cache. It stores only `admissible`/`blocked` verdicts, exactly as a
+  normal check does.
+- `check()` now converts an unexpected non-`GuardError` throw into the
+  fail-closed `undetermined` verdict with the original value on `cause`.
+  `InvalidInputError` stays unwrapped, and the verdict is never `admissible`.
+
+**The live suite was not run for this change.** No `.env.phase2` credentials
+were available, so `npm run test:integration` was not executed and no fresh live
+enforcement result is claimed. None of the changes alter the guard's
+block/admit decision; the recorded Phase-2 scenarios remain the contract-side
+proof for that decision. A maintainer with `.env.phase2` should run the live
+suite against this branch before merge.
+
+### What did run locally
+
+```text
+npm run typecheck
+npm run lint
+npm run format:check
+npm run check:strict-ratchet
+npm run test:types
+npm test
+npm run test:coverage:floor
+npm run build
+npm run test:exports
+node scripts/check-doc-links.ts
+node scripts/check-enforcement-evidence.ts --check-structure
+```
+
+The offline checks above passed; they do not substitute for the live-testnet
+scenarios.
